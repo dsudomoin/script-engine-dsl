@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+.kotlin/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Migration runtime outputs
+logs/
+
+# Misc
+*.bak
+*~
+*.swp
