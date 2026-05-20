@@ -23,6 +23,9 @@ bin/
 # Migration runtime outputs
 logs/
 
+# Internal design docs / plans (kept locally, not published)
+/docs/superpowers/
+
 # Misc
 *.bak
 *~

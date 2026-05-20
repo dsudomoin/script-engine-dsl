@@ -1,0 +1,39 @@
+[versions]
+kotlin       = "2.1.20"
+jackson      = "2.18.2"
+slf4j        = "2.0.16"
+junit        = "5.11.4"
+assertj      = "3.26.3"
+kora         = "1.1.25"
+testcontainers = "1.21.3"
+postgresql   = "42.7.7"
+logback      = "1.5.16"
+
+[libraries]
+kotlin-stdlib          = { module = "org.jetbrains.kotlin:kotlin-stdlib",          version.ref = "kotlin" }
+jackson-csv            = { module = "com.fasterxml.jackson.dataformat:jackson-dataformat-csv", version.ref = "jackson" }
+jackson-kotlin         = { module = "com.fasterxml.jackson.module:jackson-module-kotlin", version.ref = "jackson" }
+slf4j-api              = { module = "org.slf4j:slf4j-api",                          version.ref = "slf4j" }
+
+junit-jupiter          = { module = "org.junit.jupiter:junit-jupiter",              version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+assertj-core           = { module = "org.assertj:assertj-core",                     version.ref = "assertj" }
+logback-classic        = { module = "ch.qos.logback:logback-classic",               version.ref = "logback" }
+
+kora-common                 = { module = "ru.tinkoff.kora:common",                  version.ref = "kora" }
+kora-config-common          = { module = "ru.tinkoff.kora:config-common",           version.ref = "kora" }
+kora-config-hocon           = { module = "ru.tinkoff.kora:config-hocon",            version.ref = "kora" }
+kora-application-graph      = { module = "ru.tinkoff.kora:application-graph",       version.ref = "kora" }
+kora-database-jdbc          = { module = "ru.tinkoff.kora:database-jdbc",           version.ref = "kora" }
+kora-database-cassandra     = { module = "ru.tinkoff.kora:database-cassandra",      version.ref = "kora" }
+kora-kafka                  = { module = "ru.tinkoff.kora:kafka",                   version.ref = "kora" }
+kora-http-client            = { module = "ru.tinkoff.kora:http-client-common",      version.ref = "kora" }
+kora-annotation-processor   = { module = "ru.tinkoff.kora:annotation-processors",   version.ref = "kora" }
+kora-test-junit5            = { module = "ru.tinkoff.kora:test-junit5",             version.ref = "kora" }
+
+testcontainers-postgresql   = { module = "org.testcontainers:postgresql",           version.ref = "testcontainers" }
+testcontainers-cassandra    = { module = "org.testcontainers:cassandra",            version.ref = "testcontainers" }
+testcontainers-kafka        = { module = "org.testcontainers:kafka",                version.ref = "testcontainers" }
+testcontainers-junit        = { module = "org.testcontainers:junit-jupiter",        version.ref = "testcontainers" }
+
+postgresql-driver           = { module = "org.postgresql:postgresql",               version.ref = "postgresql" }
