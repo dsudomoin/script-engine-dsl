@@ -34,7 +34,11 @@ interface MigrationContext : ResourceRegistry {
     /** Аккумулятор статистики прогона. Инкрементируется автоматически из `forEach` / `guardWrite`. */
     val report: ReportBuilder
 
-    /** Пул потоков для параллельных воркеров `forEach`. По умолчанию `FixedThreadPool(parallel)`. */
+    /**
+     * Пул потоков для воркеров `forEach`. Runner создаёт cached pool: сколько воркеров реально
+     * работает, решает `forEach(parallel = N)` через свой семафор, а пул обязан уметь выдать
+     * столько потоков, сколько попросили. Подменяется целиком через `@Tag(MigrationExecutor::class)`.
+     */
     val executor: Executor
 
     /**
@@ -52,6 +56,12 @@ interface MigrationContext : ResourceRegistry {
      * при `progress = Progress.Default`.
      */
     val defaultProgressEvery: Int
+
+    /**
+     * Значение аргумента `parallel` у `forEach`, если он не задан явно. Берётся из
+     * `migration.defaults.parallel` в HOCON (дефолт 1 — последовательная обработка).
+     */
+    val defaultParallel: Int
 
     /**
      * Порог количества `SKIP`-овок, после которого `forEach` прерывает миграцию (бросает
@@ -122,4 +132,21 @@ interface MigrationContext : ResourceRegistry {
      *             сериализаторы, либо `toString()` по умолчанию.
      */
     fun auditError(e: Throwable, item: Any?)
+
+    /**
+     * Ресурс, единственный на весь прогон для данного [key]. Первый вызов создаёт его через
+     * [factory] и регистрирует в реестре (как [register]); последующие вызовы с тем же ключом
+     * отдают тот же инстанс.
+     *
+     * Нужен op-хендлам, которые естественно дёргать прямо в теле `forEach`: без мемоизации
+     * `topic(producer, "t")` внутри цикла на каждый item клал бы в реестр новый объект, и на
+     * миллионе item'ов сам реестр стал бы утечкой. Используется внутри `kafka(...)` и
+     * `topic(...)`; в пользовательском коде уместен для собственных op-обёрток.
+     *
+     * [factory] не должна вызывать `shared` — вложенный вызов на той же мапе заблокируется.
+     *
+     * @param key идентичность ресурса. Для op-хендлов — сам клиент (`Producer`, `CqlSession`)
+     *            либо `data`-ключ из клиента и имени.
+     */
+    fun <T : AutoCloseable> shared(key: Any, factory: () -> T): T
 }

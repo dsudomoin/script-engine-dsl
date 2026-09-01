@@ -5,15 +5,18 @@ import io.github.dsudomoin.migration.OnError
 import io.github.dsudomoin.migration.Progress
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
 import java.util.concurrent.Semaphore
 
-class ForEachEngine(
+internal class ForEachEngine(
     private val ctx: MigrationContext,
 ) {
+    private val warnedCallbacks = ConcurrentHashMap.newKeySet<String>()
+
 
     fun <T> runSingle(
         items: Iterable<T>,
@@ -58,7 +61,8 @@ class ForEachEngine(
     }
 
     private fun <U> runAcross(items: Iterable<U>, parallel: Int, work: (U) -> Unit) {
-        if (parallel <= 1) {
+        require(parallel > 0) { "forEach(parallel = $parallel): parallel must be > 0" }
+        if (parallel == 1) {
             items.forEach(work)
             return
         }
@@ -68,7 +72,12 @@ class ForEachEngine(
         val executor = ctx.executor
         val semaphore = Semaphore(parallel)
         val exceptions = ConcurrentLinkedQueue<Throwable>()
-        val futures = mutableListOf<Future<*>>()
+        // Здесь копится только то, что ещё имеет смысл отменять. Раньше список рос по одному
+        // Future на КАЖДЫЙ item за весь прогон и не чистился никогда: семафор ограничивает число
+        // задач в работе, но не число удерживаемых объектов — на миллионных выгрузках это живой
+        // мусор в heap'е. Компактим, когда список перерастает окно семафора.
+        val futures = ArrayList<Future<*>>()
+        val compactThreshold = maxOf(parallel * 4, 64)
 
         // Если executor — ExecutorService, используем submit(): возвращает Future, у которого
         // cancel(true) реально шлёт Thread.interrupt() в running task. Cooperative-блок (user
@@ -115,6 +124,7 @@ class ForEachEngine(
                     semaphore.release()
                 }
             }
+            if (futures.size >= compactThreshold) futures.removeIf { it.isDone }
             futures += if (canInterrupt) {
                 (executor as ExecutorService).submit(task)
             } else {
@@ -183,7 +193,7 @@ class ForEachEngine(
                 }
                 safeAudit(e, item)
                 ctx.report.incFailed()
-                onErrorLog?.invoke(e, item)
+                onErrorLog?.let { cb -> safeCallback("onErrorLog") { cb(e, item) } }
                 throw e
             }
 
@@ -211,7 +221,7 @@ class ForEachEngine(
                     classifierError.addSuppressed(e)
                     safeAudit(e, item)
                     ctx.report.incFailed()
-                    onErrorLog?.invoke(e, item)
+                    onErrorLog?.let { cb -> safeCallback("onErrorLog") { cb(e, item) } }
                     throw classifierError
                 }
                 when (decision) {
@@ -219,7 +229,7 @@ class ForEachEngine(
                     OnError.Decision.Fail -> {
                         safeAudit(e, item)
                         ctx.report.incFailed()
-                        onErrorLog?.invoke(e, item)
+                        onErrorLog?.let { cb -> safeCallback("onErrorLog") { cb(e, item) } }
                         throw e
                     }
                 }
@@ -229,7 +239,32 @@ class ForEachEngine(
 
     private fun <U> successAccounting(item: U, logEach: ((U) -> String)?) {
         ctx.report.incSuccessful()
-        logEach?.invoke(item)?.let { ctx.log.info(it) }
+        if (logEach == null) return
+        safeCallback("logEach") { logEach(item)?.let { ctx.log.info(it) } }
+    }
+
+    /**
+     * Диагностические колбэки (`logEach`, `onErrorLog`) не должны уметь провалить item. Раньше их
+     * исключение летело из учётного блока и трактовалось как отказ обработки: item попадал и в
+     * `successful`, и в `failed`, а под дефолтным `OnError.Fail` миграция обрывалась уже ПОСЛЕ
+     * того, как запись была выполнена. Про первый такой сбой сообщаем в отчёт, дальше молчим —
+     * иначе на миллионе item'ов список warnings сам станет утечкой.
+     */
+    private inline fun safeCallback(what: String, body: () -> Unit) {
+        try {
+            body()
+        } catch (t: Throwable) {
+            if (t is InterruptedException) {
+                Thread.currentThread().interrupt(); throw t
+            }
+            if (warnedCallbacks.add(what)) {
+                ctx.log.warn("$what callback failed; item outcome is unchanged", t)
+                ctx.report.addWarning(
+                    "$what callback failed: ${t.javaClass.simpleName}: ${t.message ?: ""} " +
+                        "(item outcome unchanged; further failures of this callback are not reported)",
+                )
+            }
+        }
     }
 
     private fun <U> skipAccounting(e: Throwable, item: U, onErrorLog: ((Throwable, U) -> Unit)?) {
@@ -239,7 +274,7 @@ class ForEachEngine(
         }
         safeAudit(e, item)
         ctx.report.incSkipped()
-        onErrorLog?.invoke(e, item)
+        onErrorLog?.let { cb -> safeCallback("onErrorLog") { cb(e, item) } }
         // Realtime threshold check: после каждого SKIP проверяем, не превысили ли допуск.
         val thr = ctx.errorThreshold
         if (thr > 0) {

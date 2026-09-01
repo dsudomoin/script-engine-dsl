@@ -24,6 +24,7 @@ class ReportBuilder(
     private val successful = AtomicLong()
     private val skipped = AtomicLong()
     private val failed = AtomicLong()
+    private val asyncFailed = AtomicLong()
     private val dryRunSkipped = ConcurrentHashMap<String, AtomicLong>()
     private val warnings = CopyOnWriteArrayList<String>()
 
@@ -31,6 +32,14 @@ class ReportBuilder(
     fun incSuccessful()               { successful.incrementAndGet() }
     fun incSkipped()                  { skipped.incrementAndGet() }
     fun incFailed()                   { failed.incrementAndGet() }
+
+    /**
+     * Отказ ДОСТАВКИ, обнаруженный после того, как item уже засчитан успешным (async-publish в
+     * Kafka: `forEach` видит успех в момент отправки, брокер отвечает ошибкой позже). Отдельный
+     * счётчик, а не `failed`, чтобы не ломать тождество `processed = successful + skipped + failed`
+     * и при этом не прятать потерю сообщений.
+     */
+    fun incAsyncFailed()              { asyncFailed.incrementAndGet() }
 
     /** Инкрементить счётчик dry-run-пропущенных write'ов по метке (используется внутри `guardWrite`). */
     fun incDryRunSkipped(label: String) {
@@ -42,6 +51,18 @@ class ReportBuilder(
 
     /** Текущее значение `skipped` — для проверки `errorThreshold` по ходу прогона. */
     fun skippedCount(): Long = skipped.get()
+
+    /** Текущее число отказов async-доставки — runner использует для финального exit-кода. */
+    fun asyncFailedCount(): Long = asyncFailed.get()
+
+    /** Текущее значение `processed` — runner использует для post-mortem проверок. */
+    fun processedCount(): Long = processed.get()
+
+    /**
+     * `true`, если через `guardWrite` не прошло ни одной записи. Под dry-run это единственный
+     * наблюдаемый признак того, что скрипт пишет мимо гейта (забытый `mutation { }`).
+     */
+    fun noWritesGated(): Boolean = dryRunSkipped.isEmpty()
 
     /** Immutable snapshot текущего состояния. Вызывается runner'ом один раз в конце. */
     fun build(errorsFile: Path? = null, tracesFile: Path? = null): MigrationReport {
@@ -57,6 +78,7 @@ class ReportBuilder(
             successful = successful.get(),
             skipped = skipped.get(),
             failed = failed.get(),
+            asyncFailed = asyncFailed.get(),
             dryRunSkipped = dryRunSkipped.mapValues { it.value.get() },
             errorsFile = errorsFile,
             tracesFile = tracesFile,

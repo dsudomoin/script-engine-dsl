@@ -6,7 +6,7 @@ import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
-class ProgressTicker(
+internal class ProgressTicker(
     private val mode: Progress,
     private val total: Long?,
     private val clock: Clock = Clock.systemDefaultZone(),

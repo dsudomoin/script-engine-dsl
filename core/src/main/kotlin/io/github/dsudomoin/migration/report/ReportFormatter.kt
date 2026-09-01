@@ -21,7 +21,7 @@ import java.util.*
  */
 class ReportFormatter(private val asciiOnly: Boolean = false) {
 
-    private val dt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault())
+    private val dt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX").withZone(ZoneId.systemDefault())
 
     /** Отрендерить отчёт. Результат уже содержит `\n`-разделители — можно прямо передавать в `log.info`. */
     fun format(r: MigrationReport): String {
@@ -32,6 +32,12 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
         val fl = if (asciiOnly) "[FL]" else "✗"
         val dr = if (asciiOnly) "[--]" else "⌀"
         val warn = if (asciiOnly) "[!]" else "⚠"
+
+        // Печатаем строку только когда отказы есть: в норме её быть не должно, и постоянная
+        // нулевая строка приучила бы глаз её пропускать.
+        val asyncLine = if (r.asyncFailed > 0) {
+            "  $fl Async delivery failed:  ${fmt(r.asyncFailed)}\n"
+        } else ""
 
         val warningsBlock = if (r.warnings.isNotEmpty()) {
             val list = r.warnings.joinToString("\n") { "    - $it" }
@@ -60,6 +66,7 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
             append("  $ok Successful:            ${fmt(r.successful)}\n")
             append("  $sk Skipped (errors):      ${fmt(r.skipped)}\n")
             append("  $fl Failed:                ${fmt(r.failed)}\n")
+            append(asyncLine)
             append(warningsBlock)
             append(dryLine)
             append("$mid\n")

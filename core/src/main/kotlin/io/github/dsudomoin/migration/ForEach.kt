@@ -9,7 +9,10 @@ import io.github.dsudomoin.migration.internal.ForEachEngine
  * итерации — `report.successful++`; при ошибке — поведение определяется [onError]. Прогресс
  * пишется в лог согласно [progress].
  *
- * @param parallel число параллельных воркеров. `1` (дефолт) = sequential.
+ * @param parallel число параллельных воркеров. Дефолт — [MigrationContext.defaultParallel]
+ *                 (`migration.defaults.parallel` в HOCON, из коробки `1` = sequential). Пул
+ *                 runner'а cached, поэтому запрошенное число воркеров выдаётся реально, а не
+ *                 обрезается размером пула.
  * @param onError политика при ошибке. Дефолт [OnError.Fail] — прервать миграцию на первой.
  * @param onErrorLog дополнительный (помимо авто-аудита) лог-колбэк при ошибке. Получает item,
  *                   на котором споткнулись. Полезно для warn-level логов с контекстом.
@@ -19,7 +22,7 @@ import io.github.dsudomoin.migration.internal.ForEachEngine
  */
 fun <T> MigrationContext.forEach(
     items: Iterable<T>,
-    parallel: Int = 1,
+    parallel: Int = defaultParallel,
     onError: OnError = OnError.Fail,
     onErrorLog: ((Throwable, T) -> Unit)? = null,
     logEach: ((T) -> String)? = null,
@@ -37,13 +40,19 @@ fun <T> MigrationContext.forEach(
  * для уменьшения round-trip'ов в HTTP-сервисы.
  *
  * @param chunk размер батча. На 1M item'ов и `chunk=500` будет ~2000 батчей.
+ *
+ * NB: для `Iterable` разбиение материализует `List<List<T>>` целиком ДО первой обработанной
+ * пачки — источник и так уже в памяти, но пиковое потребление удваивается. Для потоковых
+ * источников (`jdbc.stream`, `readCsv`) бери [Sequence]-перегрузку: она режет лениво и держит
+ * в памяти только текущий батч.
+ *
  * @see forEach (Iterable, без chunk) для item-by-item обработки.
  */
 @JvmName("forEachChunked")
 fun <T> MigrationContext.forEach(
     items: Iterable<T>,
     chunk: Int,
-    parallel: Int = 1,
+    parallel: Int = defaultParallel,
     onError: OnError = OnError.Fail,
     onErrorLog: ((Throwable, List<T>) -> Unit)? = null,
     logEach: ((List<T>) -> String)? = null,
@@ -59,7 +68,7 @@ fun <T> MigrationContext.forEach(
  */
 fun <T> MigrationContext.forEach(
     items: Sequence<T>,
-    parallel: Int = 1,
+    parallel: Int = defaultParallel,
     onError: OnError = OnError.Fail,
     onErrorLog: ((Throwable, T) -> Unit)? = null,
     logEach: ((T) -> String)? = null,
@@ -80,7 +89,7 @@ fun <T> MigrationContext.forEach(
 fun <T> MigrationContext.forEach(
     items: Sequence<T>,
     chunk: Int,
-    parallel: Int = 1,
+    parallel: Int = defaultParallel,
     onError: OnError = OnError.Fail,
     onErrorLog: ((Throwable, List<T>) -> Unit)? = null,
     logEach: ((List<T>) -> String)? = null,

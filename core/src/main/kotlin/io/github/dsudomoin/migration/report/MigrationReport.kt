@@ -11,7 +11,9 @@ import java.time.Instant
  * @property processed всего обработано item'ов / батчей (зависит от чанк-режима `forEach`).
  * @property successful сколько прошли успешно.
  * @property skipped сколько ушли в Skip-ветку (item'ы в `errors.csv`).
- * @property failed unhandled-исключения, поймаонные runner'ом (зависит от [io.github.dsudomoin.migration.ScriptPolicy]).
+ * @property failed unhandled-исключения, пойманные runner'ом (зависит от [io.github.dsudomoin.migration.ScriptPolicy]).
+ * @property asyncFailed отказы доставки, обнаруженные уже после того, как item засчитан успешным
+ *                       (async-publish в Kafka). Не входят в [failed], но поднимают exit-код до 1.
  * @property dryRunSkipped разбивка `label → count` для skipped writes под dry-run. Ключи —
  *                         human-readable метки операций (`"jdbc.execute"`, `"kafka.publish"`,
  *                         `"mutation:legacy webhook ..."`).
@@ -31,6 +33,7 @@ data class MigrationReport(
     val successful: Long,
     val skipped: Long,
     val failed: Long,
+    val asyncFailed: Long = 0,
     val dryRunSkipped: Map<String, Long>,
     val errorsFile: Path?,
     val tracesFile: Path?,

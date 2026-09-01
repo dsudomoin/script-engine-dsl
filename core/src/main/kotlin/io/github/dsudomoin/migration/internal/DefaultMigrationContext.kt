@@ -9,6 +9,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executor
 import java.util.concurrent.ForkJoinPool
@@ -32,9 +33,11 @@ class DefaultMigrationContext internal constructor(
     override val errors: CsvFileErrorReporter,
     override val defaultProgressEvery: Int = 1000,
     override val errorThreshold: Long = 0,
+    override val defaultParallel: Int = 1,
 ) : MigrationContext {
 
     private val resources = ConcurrentLinkedDeque<AutoCloseable>()
+    private val sharedResources = ConcurrentHashMap<Any, AutoCloseable>()
     private val closed = AtomicBoolean(false)
 
     override fun <R> guardWrite(label: String, args: Map<String, Any?>, dryRunDefault: R, action: () -> R): R {
@@ -53,6 +56,19 @@ class DefaultMigrationContext internal constructor(
 
     override fun auditError(e: Throwable, item: Any?) {
         errors.report(e, item)
+    }
+
+    override fun <T : AutoCloseable> shared(key: Any, factory: () -> T): T {
+        // После закрытия реестра не кэшируем: register ниже закроет созданное сразу, и класть
+        // закрытый объект в мапу как «общий на прогон» было бы враньём.
+        if (closed.get()) {
+            val late = factory()
+            register(late)
+            return late
+        }
+        val created = sharedResources.computeIfAbsent(key) { factory().also { register(it) } }
+        @Suppress("UNCHECKED_CAST")
+        return created as T
     }
 
     override fun register(c: AutoCloseable) {
@@ -75,6 +91,7 @@ class DefaultMigrationContext internal constructor(
             closeOne(iter.next(), "")
         }
         resources.clear()
+        sharedResources.clear()
     }
 
     private fun closeOne(c: AutoCloseable, prefix: String) {
@@ -106,6 +123,7 @@ class DefaultMigrationContext internal constructor(
             outputFolder: Path? = null,
             defaultProgressEvery: Int = 1000,
             errorThreshold: Long = 0,
+            defaultParallel: Int = 1,
         ): DefaultMigrationContext {
             val of = outputFolder ?: Files.createTempDirectory("migration-test-")
             Files.createDirectories(of)
@@ -126,6 +144,7 @@ class DefaultMigrationContext internal constructor(
                 errors = reporter,
                 defaultProgressEvery = defaultProgressEvery,
                 errorThreshold = errorThreshold,
+                defaultParallel = defaultParallel,
             )
         }
 
@@ -152,6 +171,7 @@ class DefaultMigrationContext internal constructor(
             errors: CsvFileErrorReporter,
             defaultProgressEvery: Int = 1000,
             errorThreshold: Long = 0,
+            defaultParallel: Int = 1,
         ): DefaultMigrationContext = DefaultMigrationContext(
             dryRun = dryRun,
             log = LoggerFactory.getLogger("io.github.dsudomoin.migration.$name"),
@@ -161,6 +181,7 @@ class DefaultMigrationContext internal constructor(
             errors = errors,
             defaultProgressEvery = defaultProgressEvery,
             errorThreshold = errorThreshold,
+            defaultParallel = defaultParallel,
         )
     }
 }
