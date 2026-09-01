@@ -11,6 +11,7 @@ import org.apache.kafka.common.serialization.StringSerializer
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.testcontainers.kafka.ConfluentKafkaContainer
@@ -19,6 +20,7 @@ import java.util.Properties
 import java.util.UUID
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@Tag("docker")
 class KafkaOpsIntegrationTest {
 
     private val kafka = ConfluentKafkaContainer("confluentinc/cp-kafka:7.6.1").apply { start() }

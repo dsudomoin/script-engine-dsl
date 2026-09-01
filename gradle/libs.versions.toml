@@ -1,5 +1,6 @@
 [versions]
 kotlin       = "2.1.20"
+ksp          = "2.1.20-1.0.32"
 jackson      = "2.18.2"
 slf4j        = "2.0.16"
 junit        = "5.11.4"
@@ -28,7 +29,7 @@ kora-database-jdbc          = { module = "ru.tinkoff.kora:database-jdbc",       
 kora-database-cassandra     = { module = "ru.tinkoff.kora:database-cassandra",      version.ref = "kora" }
 kora-kafka                  = { module = "ru.tinkoff.kora:kafka",                   version.ref = "kora" }
 kora-http-client            = { module = "ru.tinkoff.kora:http-client-common",      version.ref = "kora" }
-kora-annotation-processor   = { module = "ru.tinkoff.kora:annotation-processors",   version.ref = "kora" }
+kora-symbol-processor       = { module = "ru.tinkoff.kora:symbol-processors",       version.ref = "kora" }
 kora-test-junit5            = { module = "ru.tinkoff.kora:test-junit5",             version.ref = "kora" }
 
 testcontainers-postgresql   = { module = "org.testcontainers:postgresql",           version.ref = "testcontainers" }
@@ -37,3 +38,6 @@ testcontainers-kafka        = { module = "org.testcontainers:kafka",            
 testcontainers-junit        = { module = "org.testcontainers:junit-jupiter",        version.ref = "testcontainers" }
 
 postgresql-driver           = { module = "org.postgresql:postgresql",               version.ref = "postgresql" }
+
+[plugins]
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }

@@ -12,6 +12,7 @@ import io.github.dsudomoin.migration.kora.ops.cassandra
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.api.io.TempDir
@@ -21,6 +22,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@Tag("docker")
 class ComparisonPilotTest {
 
     private val primaryC = CassandraContainer("cassandra:4.1").apply { start() }
