@@ -24,6 +24,15 @@ class SqlOps internal constructor(
     internal val inTx: Boolean,
 ) {
     /**
+     * Поток, открывший транзакцию. `java.sql.Connection` не потокобезопасен, а
+     * `transactional { forEach(items, parallel = 4) { execute(...) } }` компилируется и выглядит
+     * безобидно: четыре воркера начинают готовить statement'ы на одном соединении. ThreadLocal-
+     * guard `txInProgress` этот случай не ловит принципиально — воркеры сидят на других потоках,
+     * поэтому владельца запоминаем явно.
+     */
+    private val txOwner: Thread? = if (txConn != null) Thread.currentThread() else null
+
+    /**
      * Выполнить SELECT, материализовать результат в `List<T>`. Подходит для запросов с
      * известным конечным размером. Для миллионных выгрузок используй [stream].
      *
@@ -33,6 +42,7 @@ class SqlOps internal constructor(
      * ```
      */
     fun <T> query(sql: String, vararg params: Pair<String, Any?>, mapper: (ResultSet) -> T): List<T> {
+        requireReadOnly(sql, "query")
         val (rendered, values) = validateAndRender(sql, params)
         return withConn { conn ->
             conn.prepareStatement(rendered).use { ps ->
@@ -99,6 +109,7 @@ class SqlOps internal constructor(
         consume: (Sequence<T>) -> R,
     ): R {
         require(fetchSize > 0) { "fetchSize must be > 0, got $fetchSize" }
+        requireReadOnly(sql, "stream")
         val (rendered, values) = validateAndRender(sql, params)
         return withConn { conn ->
             conn.prepareStatement(rendered).use { ps ->
@@ -149,6 +160,50 @@ class SqlOps internal constructor(
             }
         }
 
+    /**
+     * Пишущий запрос, возвращающий строки (`INSERT ... RETURNING`, `UPDATE ... RETURNING`).
+     * Проходит dry-run gate как обычная запись: под dry-run [mapper] не вызывается и
+     * возвращается пустой список.
+     *
+     * Существует именно для того, чтобы [query] можно было держать строго читающим: раньше
+     * `query("insert ... returning id")` был единственным способом получить сгенерированные
+     * идентификаторы — и выполнялся в том числе под dry-run, мимо всякого гейта.
+     */
+    fun <T> executeReturning(sql: String, vararg params: Pair<String, Any?>, mapper: (ResultSet) -> T): List<T> {
+        val (rendered, values) = validateAndRender(sql, params)
+        return ctx.guardWrite(
+            "jdbc.executeReturning",
+            mapOf("sql" to sql.take(80)),
+            dryRunDefault = emptyList(),
+        ) {
+            withConn { conn ->
+                conn.prepareStatement(rendered).use { ps ->
+                    bindValues(ps, values)
+                    ps.executeQuery().use { rs ->
+                        val out = ArrayList<T>()
+                        while (rs.next()) out += mapper(rs)
+                        out
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Транзакционный scope под dry-run: реальное соединение не открывается (это дало бы
+     * BEGIN/COMMIT round-trip на каждый блок), но ThreadLocal-флаг взводится тот же самый.
+     * Без него вложенный `transactional` детектировался бы только в бою — репетиция проходила
+     * бы зелёной ровно там, где боевой прогон падает.
+     */
+    internal fun <R> runDryRunTx(block: SqlOps.() -> R): R {
+        txInProgress.set(true)
+        try {
+            return block()
+        } finally {
+            txInProgress.set(false)
+        }
+    }
+
     internal fun <R> runRealTx(block: SqlOps.() -> R): R {
         if (txInProgress.get()) {
             throw IllegalStateException(
@@ -178,7 +233,17 @@ class SqlOps internal constructor(
     internal fun hasActiveTxConnection(): Boolean = txInProgress.get() || db.currentConnection() != null
 
     private fun <R> withConn(block: (Connection) -> R): R =
-        if (txConn != null) block(txConn) else db.inTx<R> { conn -> block(conn) }
+        if (txConn != null) {
+            check(Thread.currentThread() === txOwner) {
+                "tx-bound jdbc ops used from thread '${Thread.currentThread().name}', but the " +
+                    "transaction belongs to '${txOwner?.name}'. java.sql.Connection is not thread-safe: " +
+                    "do not run a parallel forEach inside transactional { } — put transactional { } " +
+                    "inside the forEach body instead."
+            }
+            block(txConn)
+        } else {
+            db.inTx<R> { conn -> block(conn) }
+        }
 
     companion object {
         // Per-thread флаг «мы внутри transactional». Используется как guard против вложенных
@@ -187,6 +252,8 @@ class SqlOps internal constructor(
         // Static (companion), чтобы один SqlOps-инстанс не "видел" tx другого: jdbc(db) каждый
         // раз создаёт новый SqlOps, флаг должен быть общий для всех SqlOps на потоке.
         private val txInProgress: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
+
+        private val READ_ONLY_KEYWORDS = setOf("select", "with", "show", "explain", "values", "table", "describe")
     }
 
     /**
@@ -350,6 +417,56 @@ class SqlOps internal constructor(
         return rendered to names.map { map[it] }
     }
 
+    /**
+     * Пускает в [query] / [stream] только читающие запросы. Ни то, ни другое не проходит
+     * dry-run gate (и не должно — чтение под репетицией обязано работать), поэтому пишущий
+     * запрос, просунутый в `query`, выполнялся бы В БОЮ во время dry-run прогона.
+     *
+     * Проверка одинакова в обоих режимах: гейт, срабатывающий только под dry-run, дал бы
+     * зелёную репетицию при падающем бое (или наоборот) — худший вид расхождения.
+     *
+     * Известное ограничение: `WITH ... INSERT` (data-modifying CTE) начинается с `with` и
+     * проверку пройдёт. Для таких запросов используй [executeReturning].
+     */
+    private fun requireReadOnly(sql: String, method: String) {
+        val kw = firstKeyword(sql)
+        if (kw !in READ_ONLY_KEYWORDS) {
+            throw IllegalArgumentException(
+                "jdbc().$method() accepts read statements only, got '${kw.ifEmpty { "?" }} ...'. " +
+                    "Use execute(...) for writes, or executeReturning(...) if you need the rows back — " +
+                    "both go through the dry-run gate, while $method() would run for real during a dry run. " +
+                    "SQL: ${sql.take(120)}",
+            )
+        }
+    }
+
+    /** Первое ключевое слово запроса в нижнем регистре, с пропуском ведущих комментариев. */
+    private fun firstKeyword(sql: String): String {
+        var i = 0
+        while (i < sql.length) {
+            val c = sql[i]
+            when {
+                c.isWhitespace() -> i++
+                c == '-' && i + 1 < sql.length && sql[i + 1] == '-' -> {
+                    while (i < sql.length && sql[i] != '\n') i++
+                }
+
+                c == '/' && i + 1 < sql.length && sql[i + 1] == '*' -> {
+                    val end = sql.indexOf("*/", i + 2)
+                    i = if (end < 0) sql.length else end + 2
+                }
+
+                c == '(' -> i++          // `(select ...) union ...`
+                else -> {
+                    val start = i
+                    while (i < sql.length && (sql[i].isLetter() || sql[i] == '_')) i++
+                    return sql.substring(start, i).lowercase()
+                }
+            }
+        }
+        return ""
+    }
+
     private fun bindValues(ps: PreparedStatement, values: List<Any?>) {
         values.forEachIndexed { idx, v -> ps.setObject(idx + 1, v) }
     }
@@ -380,7 +497,7 @@ fun <R> MigrationContext.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
     // `transactional` — тогда `ops.inTx == false`, но Kora уже держит открытую tx на текущем
     // потоке. Без этой проверки открылась бы ВТОРАЯ независимая tx — два connection'а, разные
     // commit'ы, противоречит API-обещанию «nested transactional не поддерживается».
-    if (!dryRun && ops.hasActiveTxConnection()) {
+    if (ops.hasActiveTxConnection()) {
         throw IllegalStateException(
             "nested transactional not supported (a Kora transaction is already open on this thread — " +
                     "do not call transactional() again from inside a transactional block)",
@@ -391,9 +508,11 @@ fun <R> MigrationContext.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
         // BEGIN/COMMIT в драйвер на каждый блок. Вместо этого выполняем block на free-mode
         // SqlOps: writes (execute/batch) silently skip через guardWrite, reads (query/stream)
         // работают (каждый в своей mini-tx). Tx semantic не нужна, т.к. ничего не пишется.
+        // ВАЖНО: тело блока при этом ВЫПОЛНЯЕТСЯ — под dry-run пропускаются отдельные записи
+        // внутри него, а не блок целиком.
         log.info("[DRY-RUN] jdbc.transactional")
         report.incDryRunSkipped("jdbc.transactional")
-        return ops.block()
+        return ops.runDryRunTx(block)
     }
     return ops.runRealTx(block)
 }

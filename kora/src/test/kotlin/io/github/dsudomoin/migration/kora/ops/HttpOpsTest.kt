@@ -2,6 +2,7 @@ package io.github.dsudomoin.migration.kora.ops
 
 import io.github.dsudomoin.migration.internal.DefaultMigrationContext
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
 
 class HttpOpsTest {
@@ -19,7 +20,7 @@ class HttpOpsTest {
     }
 
     @Test
-    fun `post под dry-run не вызывает client и возвращает дефолт 0`() {
+    fun `post под dry-run не вызывает client и возвращает 200`() {
         val ctx = DefaultMigrationContext.test(dryRun = true)
         var called = false
         val stub: HttpCall = { _, _, _, _ -> called = true; 201 }
@@ -27,7 +28,9 @@ class HttpOpsTest {
         val status = with(ctx) { http(stub).post("/hooks", "body".toByteArray()) }
 
         assertThat(called).isFalse()
-        assertThat(status).isEqualTo(0)
+        // Не 0: вызывающий код почти всегда смотрит на статус, и ноль отправил бы репетицию
+        // в ветку ошибки — dry-run обязан идти тем же путём, что и бой.
+        assertThat(status).isEqualTo(200)
         assertThat(ctx.report.build().dryRunSkipped).containsEntry("http.post", 1L)
     }
 
@@ -80,5 +83,43 @@ class HttpOpsTest {
 
         val skipped = ctx.report.build().dryRunSkipped
         assertThat(skipped).containsKeys("http.patch", "http.put", "http.delete")
+    }
+}
+
+/**
+ * Код ответа проверяется всегда: без этого мёртвый бэкенд, отвечающий 500 на каждый запрос,
+ * давал бы отчёт «100 000 successful» при нулевом эффекте бэкфилла.
+ */
+class HttpOpsStatusTest {
+
+    @Test
+    fun `не-2xx поднимает HttpStatusException и не считается успехом`() {
+        val ctx = DefaultMigrationContext.test()
+        val stub: HttpCall = { _, _, _, _ -> 500 }
+
+        val thrown = catchThrowable { with(ctx) { http(stub).post("/hooks") } }
+
+        assertThat(thrown)
+            .isInstanceOf(HttpStatusException::class.java)
+            .hasMessageContaining("POST /hooks")
+            .hasMessageContaining("500")
+        assertThat((thrown as HttpStatusException).status).isEqualTo(500)
+    }
+
+    @Test
+    fun `не-2xx на чтении тоже поднимает исключение`() {
+        val ctx = DefaultMigrationContext.test()
+        val stub: HttpCall = { _, _, _, _ -> 404 }
+
+        assertThat(catchThrowable { with(ctx) { http(stub).get("/orders/42") } })
+            .isInstanceOf(HttpStatusException::class.java)
+    }
+
+    @Test
+    fun `2xx проходит`() {
+        val ctx = DefaultMigrationContext.test()
+        val stub: HttpCall = { _, _, _, _ -> 299 }
+
+        assertThat(with(ctx) { http(stub).put("/orders/42") }).isEqualTo(299)
     }
 }
