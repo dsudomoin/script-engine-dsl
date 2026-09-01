@@ -22,6 +22,8 @@ import java.util.*
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.system.exitProcess
 
 /**
@@ -30,7 +32,7 @@ import kotlin.system.exitProcess
  * (тестовый конструктор с `exit`-callback'ом существует для unit-тестов).
  *
  * Поведение `init()`:
- * 1. Если `config.run == null` — runner idle, возврат без действий.
+ * 1. Если `config.run() == null` — runner idle, возврат без действий.
  * 2. Проверка уникальности имён [Migration]'ов в графе → exit 2 при дубликате.
  * 3. Lookup миграции по имени → exit 2 при отсутствии.
  * 4. Создание `outputFolder`, attach logback `FileAppender` к root-логгеру.
@@ -57,8 +59,12 @@ class MigrationRunner(
 
     private val log = LoggerFactory.getLogger("io.github.dsudomoin.migration.runner")
 
+    private companion object {
+        const val SHUTDOWN_WAIT_SECONDS = 30L
+    }
+
     override fun init() {
-        val name = config.run
+        val name = config.run()
         if (name == null) {
             log.info("migration.run не задан — runner idle")
             return
@@ -75,8 +81,17 @@ class MigrationRunner(
             return
         }
 
-        val outputFolder = config.outputFolder ?: Paths.get("logs", migration.name)
-        Files.createDirectories(outputFolder)
+        // Создание папки вынесено под обработку ошибки: битый путь в HOCON или отсутствие прав
+        // иначе пробили бы init() насквозь необработанным IOException — мимо заявленных exit-кодов.
+        val outputFolder = try {
+            val folder = config.outputFolder()?.let { Paths.get(it) } ?: Paths.get("logs", migration.name)
+            Files.createDirectories(folder)
+            folder
+        } catch (e: Exception) {
+            log.error("Cannot create migration.outputFolder '${config.outputFolder() ?: "logs/${migration.name}"}'", e)
+            exit(2)
+            return
+        }
 
         // Важно: exit(code) вызывается ПОСЛЕ возврата из executeMigration() — то есть после
         // того, как finally закрыл fileLogHandle (детач + stop FileAppender'а). Если бы exit
@@ -89,36 +104,42 @@ class MigrationRunner(
     private fun executeMigration(migration: Migration, outputFolder: Path): Int {
         val errorsFile = outputFolder.resolve("errors.csv")
         val traceFile = outputFolder.resolve("errors.log")
-        val report = ReportBuilder(migration.name, migration.author, config.dryRun)
+        val report = ReportBuilder(migration.name, migration.author, config.dryRun())
         val fileLogHandle = attachFileLogger(outputFolder, report)
         try {
             val reporter = CsvFileErrorReporter(
                 migration.name, migration.author,
                 errorsFile, traceFile,
-                maxItemReprLength = config.errorReporting.maxItemReprLength,
-                includeStackTrace = config.errorReporting.includeStackTrace,
+                maxItemReprLength = config.errorReporting().maxItemReprLength(),
+                includeStackTrace = config.errorReporting().includeStackTrace(),
             )
-            val executor = customExecutor ?: Executors.newFixedThreadPool(config.defaults.parallel) { r ->
-                Thread(r, "migration-${migration.name}").apply { isDaemon = true }
+            // Cached, а не fixed: реальный параллелизм задаёт `forEach(parallel = N)` через
+            // свой семафор, и пул обязан уметь выдать N потоков — иначе `parallel` был бы
+            // декорацией, а вложенный forEach вставал бы намертво на исчерпании фиксированного
+            // пула. Потоки daemon и переиспользуются, простаивающие отмирают сами.
+            val threadNo = AtomicInteger()
+            val executor = customExecutor ?: Executors.newCachedThreadPool { r ->
+                Thread(r, "migration-${migration.name}-${threadNo.incrementAndGet()}").apply { isDaemon = true }
             }
             val ctx = DefaultMigrationContext.internalCreate(
-                dryRun = config.dryRun,
+                dryRun = config.dryRun(),
                 name = migration.name,
                 report = report,
                 executor = executor,
                 outputFolder = outputFolder,
                 errors = reporter,
-                defaultProgressEvery = config.defaults.progressEvery,
-                errorThreshold = config.defaults.errorThreshold,
+                defaultProgressEvery = config.defaults().progressEvery(),
+                errorThreshold = config.defaults().errorThreshold(),
+                defaultParallel = config.defaults().parallel(),
             )
             // Дефолтный пул owned runner'ом — регистрируем shutdown как AutoCloseable, чтобы
             // ctx.closeRegistered() (в finally ниже) его остановил. Custom executor лежит на
             // ответственности пользователя — не трогаем.
             if (customExecutor == null && executor is ExecutorService) {
-                ctx.register(AutoCloseable { executor.shutdownNow() })
+                ctx.register(AutoCloseable { shutdownPool(executor, report) })
             }
 
-            val code = try {
+            var code = try {
                 runMigration(migration, ctx)
             } finally {
                 // Закрываем в обратном порядке создания: сначала юзер-ресурсы (CSV, Kafka-topic
@@ -134,10 +155,30 @@ class MigrationRunner(
             // CsvFileErrorReporter создаёт файлы лениво (только на первой ошибке). Если миграция
             // прошла без SKIP-ок — файлов нет; не показываем «Error details: <путь>» с дохлым
             // путём в финальном отчёте.
+            // Забытый `mutation { }` — самый дорогой тихий промах библиотеки: под dry-run прямой
+            // вызов репозитория или паблишера мимо guardWrite выполняется по-настоящему. Наблюдаемый
+            // признак ровно один — пустой breakdown при непустом processed. Делаем его громким.
+            if (config.dryRun() && report.processedCount() > 0 && report.noWritesGated()) {
+                val msg = "DRY-RUN processed ${report.processedCount()} item(s) but intercepted 0 writes. " +
+                    "If this migration writes anything, those writes went through FOR REAL — " +
+                    "wrap typed client calls in mutation(\"label\") { ... }"
+                log.warn(msg)
+                report.addWarning(msg)
+            }
+
+            // Отказы доставки прилетают асинхронно и учитываются в момент flush'а продюсера,
+            // то есть уже после того, как runMigration вернул код. Прогон, потерявший сообщения,
+            // не имеет права закончиться нулём.
+            val asyncFailed = report.asyncFailedCount()
+            if (asyncFailed > 0 && code == 0) {
+                log.error("$asyncFailed message(s) failed to deliver asynchronously; see errors.csv")
+                code = 1
+            }
+
             val errorsFileOrNull = errorsFile.takeIf { Files.exists(it) }
             val traceFileOrNull = traceFile.takeIf { Files.exists(it) }
             val built = report.build(errorsFileOrNull, traceFileOrNull)
-            log.info("\n" + ReportFormatter(config.report.asciiOnly).format(built))
+            log.info("\n" + ReportFormatter(config.report().asciiOnly()).format(built))
             return code
         } finally {
             fileLogHandle?.close()
@@ -145,6 +186,30 @@ class MigrationRunner(
     }
 
     override fun release() {}
+
+    /**
+     * Останов собственного пула. `shutdown()` + ожидание вместо голого `shutdownNow()`: к этому
+     * моменту `migrate()` уже вернулся, но асинхронные хвосты (callback'и продюсера, задачи,
+     * досылаемые из пользовательских ресурсов при закрытии) ещё могут доигрывать. Если за
+     * [SHUTDOWN_WAIT_SECONDS] пул не встал — гасим принудительно и поднимаем это в отчёт,
+     * иначе потеря задач осталась бы невидимой.
+     */
+    private fun shutdownPool(pool: ExecutorService, report: ReportBuilder) {
+        pool.shutdown()
+        val terminated = try {
+            pool.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!terminated) {
+            val dropped = pool.shutdownNow().size
+            val msg = "migration thread pool did not terminate in ${SHUTDOWN_WAIT_SECONDS}s; " +
+                "$dropped queued task(s) dropped"
+            log.warn(msg)
+            report.addWarning(msg)
+        }
+    }
 
     /**
      * Sanity-check на значения HOCON-конфига. `data class`-валидация Kora не покрывает «> 0»-
@@ -155,17 +220,17 @@ class MigrationRunner(
      */
     private fun validateConfig(): Boolean {
         val errors = mutableListOf<String>()
-        if (config.defaults.parallel <= 0) {
-            errors += "migration.defaults.parallel must be > 0, got ${config.defaults.parallel}"
+        if (config.defaults().parallel() <= 0) {
+            errors += "migration.defaults.parallel must be > 0, got ${config.defaults().parallel()}"
         }
-        if (config.defaults.progressEvery <= 0) {
-            errors += "migration.defaults.progressEvery must be > 0, got ${config.defaults.progressEvery}"
+        if (config.defaults().progressEvery() <= 0) {
+            errors += "migration.defaults.progressEvery must be > 0, got ${config.defaults().progressEvery()}"
         }
-        if (config.defaults.errorThreshold < 0) {
-            errors += "migration.defaults.errorThreshold must be >= 0 (0 = disabled), got ${config.defaults.errorThreshold}"
+        if (config.defaults().errorThreshold() < 0) {
+            errors += "migration.defaults.errorThreshold must be >= 0 (0 = disabled), got ${config.defaults().errorThreshold()}"
         }
-        if (config.errorReporting.maxItemReprLength <= 0) {
-            errors += "migration.errorReporting.maxItemReprLength must be > 0, got ${config.errorReporting.maxItemReprLength}"
+        if (config.errorReporting().maxItemReprLength() <= 0) {
+            errors += "migration.errorReporting.maxItemReprLength must be > 0, got ${config.errorReporting().maxItemReprLength()}"
         }
         if (errors.isNotEmpty()) {
             log.error("Invalid migration config:\n  - ${errors.joinToString("\n  - ")}")
@@ -191,7 +256,7 @@ class MigrationRunner(
             // Post-mortem threshold check на случай, если миграция дошла до конца естественно,
             // но количество skipped к этому моменту перевалило за порог. Realtime-check внутри
             // forEach обычно ловит первым.
-            val thr = config.defaults.errorThreshold
+            val thr = config.defaults().errorThreshold()
             if (thr > 0 && ctx.report.skippedCount() > thr) {
                 log.error("Error threshold exceeded: skipped=${ctx.report.skippedCount()} > $thr")
                 1
@@ -210,7 +275,7 @@ class MigrationRunner(
                 )
             }
             ctx.report.incFailed()
-            val policy = migration.onUnhandled ?: config.defaults.onUnhandled
+            val policy = migration.onUnhandled ?: config.defaults().onUnhandled()
             when (policy) {
                 ScriptPolicy.FAIL_FAST -> {
                     log.error("Migration ${migration.name} FAILED", e); 1
@@ -223,7 +288,27 @@ class MigrationRunner(
         }
     }
 
-    private fun attachFileLogger(outputFolder: Path, report: ReportBuilder? = null): AutoCloseable? {
+    /**
+     * Подключить файловый аппендер, если на classpath есть Logback.
+     *
+     * Обёртка вокруг [attachLogbackFileAppender] нужна из-за неочевидного: ветка «Logback нет»
+     * сама ссылается на его классы. Проверка `factory !is LoggerContext` компилируется в
+     * инструкцию instanceof, и JVM обязана разрешить символическую ссылку на класс из constant
+     * pool. С `log4j-slf4j2-impl` или `slf4j-jdk14` вместо Logback это `NoClassDefFoundError`,
+     * который пробивает `init()` насквозь: миграция не стартует вообще — вместо обещанного
+     * документацией предупреждения и работы без `migration.log`.
+     */
+    private fun attachFileLogger(outputFolder: Path, report: ReportBuilder? = null): AutoCloseable? =
+        try {
+            attachLogbackFileAppender(outputFolder, report)
+        } catch (e: LinkageError) {
+            val msg = "migration.log file output disabled: Logback not on classpath (${e.javaClass.simpleName})"
+            log.warn(msg)
+            report?.addWarning(msg)
+            null
+        }
+
+    private fun attachLogbackFileAppender(outputFolder: Path, report: ReportBuilder?): AutoCloseable? {
         val factory = LoggerFactory.getILoggerFactory()
         if (factory !is LoggerContext) {
             val msg = "migration.log file output disabled: Logback not on classpath (found ${factory.javaClass.name})"

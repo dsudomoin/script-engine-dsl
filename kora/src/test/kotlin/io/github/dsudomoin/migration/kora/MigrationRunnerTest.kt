@@ -25,7 +25,7 @@ class MigrationRunnerTest {
     @Test
     fun `runner запускает миграцию по имени и возвращает exit 0`(@TempDir tmp: Path) {
         val hit = AtomicInteger()
-        val config = MigrationConfig(run = "DUMMY-1", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "DUMMY-1", outputFolder = tmp.toString())
         var exitCode = -1
         val runner = MigrationRunner(config, listOf(DummyMig(hit)), customExecutor = null) { exitCode = it }
 
@@ -37,7 +37,7 @@ class MigrationRunnerTest {
 
     @Test
     fun `unknown migration name - exit равен 2`(@TempDir tmp: Path) {
-        val config = MigrationConfig(run = "NO-SUCH", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "NO-SUCH", outputFolder = tmp.toString())
         var exitCode = -1
         val runner = MigrationRunner(config, emptyList(), customExecutor = null) { exitCode = it }
         runner.init()
@@ -47,7 +47,7 @@ class MigrationRunnerTest {
     @Test
     fun `run not set - runner idle, migration не вызывается`(@TempDir tmp: Path) {
         val hit = AtomicInteger()
-        val config = MigrationConfig(run = null)
+        val config = MigrationConfigValues(run = null)
         var exitCode = -1
         val runner = MigrationRunner(config, listOf(DummyMig(hit)), customExecutor = null) { exitCode = it }
         runner.init()
@@ -57,7 +57,7 @@ class MigrationRunnerTest {
 
     @Test
     fun `migration log файл создаётся при наличии logback`(@TempDir tmp: Path) {
-        val config = MigrationConfig(run = "DUMMY-1", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "DUMMY-1", outputFolder = tmp.toString())
         val runner = MigrationRunner(config, listOf(DummyMig(AtomicInteger())), customExecutor = null) { }
 
         runner.init()
@@ -75,7 +75,7 @@ class MigrationRunnerTest {
                 observed = outputFolder
             }
         }
-        val config = MigrationConfig(run = "OBS-1", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "OBS-1", outputFolder = tmp.toString())
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { }
         runner.init()
         assertThat(observed).isEqualTo(tmp)
@@ -89,7 +89,7 @@ class MigrationRunnerTest {
                 out.row(1, 2)
             }
         }
-        val config = MigrationConfig(run = "CSV-1", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "CSV-1", outputFolder = tmp.toString())
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { }
         runner.init()
 
@@ -103,7 +103,7 @@ class MigrationRunnerTest {
         val sub = parent.resolve("a/b/c")
         assertThat(Files.exists(sub)).isFalse()
 
-        val config = MigrationConfig(run = "MKDIR-1", outputFolder = sub)
+        val config = MigrationConfigValues(run = "MKDIR-1", outputFolder = sub.toString())
         val runner = MigrationRunner(config, listOf(object : Migration("MKDIR-1", "test") {
             override fun MigrationContext.migrate() { /* no-op */
             }
@@ -135,7 +135,7 @@ class MigrationRunnerTest {
         }
     }
 
-    private fun config(name: String, tmp: Path) = MigrationConfig(run = name, outputFolder = tmp)
+    private fun config(name: String, tmp: Path) = MigrationConfigValues(run = name, outputFolder = tmp.toString())
 
     @Test
     fun `registered resources закрываются после успешного migrate`(@TempDir tmp: Path) {
@@ -201,10 +201,10 @@ class MigrationRunnerTest {
                 throw RuntimeException("boom")
             }
         }
-        val config = MigrationConfig(
+        val config = MigrationConfigValues(
             run = "DEFAULT-POL",
-            outputFolder = tmp,
-            defaults = MigrationConfig.Defaults(onUnhandled = ScriptPolicy.LOG_AND_COMPLETE),
+            outputFolder = tmp.toString(),
+            defaults = DefaultsValues(onUnhandled = ScriptPolicy.LOG_AND_COMPLETE),
         )
         var exitCode = -1
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { exitCode = it }
@@ -220,10 +220,10 @@ class MigrationRunnerTest {
                 throw RuntimeException("boom")
             }
         }
-        val config = MigrationConfig(
+        val config = MigrationConfigValues(
             run = "EXPLICIT-POL",
-            outputFolder = tmp,
-            defaults = MigrationConfig.Defaults(onUnhandled = ScriptPolicy.LOG_AND_COMPLETE),
+            outputFolder = tmp.toString(),
+            defaults = DefaultsValues(onUnhandled = ScriptPolicy.LOG_AND_COMPLETE),
         )
         var exitCode = -1
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { exitCode = it }
@@ -239,10 +239,10 @@ class MigrationRunnerTest {
                 observed = defaultProgressEvery
             }
         }
-        val config = MigrationConfig(
+        val config = MigrationConfigValues(
             run = "PROG-1",
-            outputFolder = tmp,
-            defaults = MigrationConfig.Defaults(progressEvery = 77),
+            outputFolder = tmp.toString(),
+            defaults = DefaultsValues(progressEvery = 77),
         )
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { }
         runner.init()
@@ -256,10 +256,10 @@ class MigrationRunnerTest {
                 forEach((1..100).toList(), onError = OnError.Skip) { _ -> error("boom") }
             }
         }
-        val config = MigrationConfig(
+        val config = MigrationConfigValues(
             run = "THR-1",
-            outputFolder = tmp,
-            defaults = MigrationConfig.Defaults(errorThreshold = 3),
+            outputFolder = tmp.toString(),
+            defaults = DefaultsValues(errorThreshold = 3),
         )
         var exitCode = -1
         val runner = MigrationRunner(config, listOf(mig), customExecutor = null) { exitCode = it }
@@ -275,7 +275,7 @@ class MigrationRunnerTest {
         val custom = Executors.newFixedThreadPool(2) { r ->
             Thread(r, "custom-mig-pool").apply { isDaemon = true }
         }
-        val config = MigrationConfig(run = "CUSTOM-EXEC", outputFolder = tmp)
+        val config = MigrationConfigValues(run = "CUSTOM-EXEC", outputFolder = tmp.toString())
         val runner = MigrationRunner(
             config,
             listOf(object : Migration("CUSTOM-EXEC", "test") {
@@ -295,10 +295,10 @@ class MigrationRunnerTest {
 
     @Test
     fun `defaults parallel = 0 - exit 2 с понятным сообщением`(@TempDir tmp: Path) {
-        val config = MigrationConfig(
+        val config = MigrationConfigValues(
             run = "BAD-CONF",
-            outputFolder = tmp,
-            defaults = MigrationConfig.Defaults(parallel = 0),
+            outputFolder = tmp.toString(),
+            defaults = DefaultsValues(parallel = 0),
         )
         var exitCode = -1
         val runner = MigrationRunner(
