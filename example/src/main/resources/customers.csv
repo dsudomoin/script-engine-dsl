@@ -1,0 +1,11 @@
+id,email,spend
+1,anna@example.com,1200
+2,boris@example.com,340
+3,clara@example.com,NOT_A_NUMBER
+4,dmitry@example.com,9800
+5,elena@example.com,15400
+6,fedor@example.com,80
+7,galina@example.com,4300
+8,igor@example.com,
+9,katya@example.com,760
+10,leonid@example.com,23000

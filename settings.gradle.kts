@@ -6,4 +6,4 @@ dependencyResolutionManagement {
     }
 }
 
-include(":core", ":kora")
+include(":core", ":kora", ":example")
