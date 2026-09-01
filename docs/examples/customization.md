@@ -1,8 +1,8 @@
 # Кастомизация Migration DSL
 
 DSL — это набор extension-функций на `MigrationContext` плюс несколько hook'ов
-(`register`, `guardWrite`, `@Tag(MigrationExecutor)`). Если из коробки чего-то не
-хватает — добавляй своё, не дожидаясь патча либы.
+(`register`, `shared`, `guardWrite`, `@Tag(MigrationExecutor)`, `MigrationExit`).
+Если из коробки чего-то не хватает — добавляй своё, не дожидаясь патча либы.
 
 Ниже — четыре типичных сценария кастомизации:
 
@@ -14,6 +14,10 @@ DSL — это набор extension-функций на `MigrationContext` пл�
 ---
 
 ## 1. Свой ops-wrapper с dry-run gate
+
+S3 в либе **нет и не планируется** — ниже он взят как образец стороннего клиента, вокруг
+которого пользователь пишет свой ops-хендл. Паттерн одинаков для любого SDK: Redis, S3,
+Elasticsearch, внутренний RPC.
 
 Допустим, в проекте используется S3-клиент, и хочется чтобы `s3(client).put(...)` под dry-run
 не пытался писать. Напиши обёртку точно так же, как сделаны `jdbc`, `cassandra`, `kafka`:
@@ -86,8 +90,48 @@ class SampleMigration(
 `s3.put: 8421` и в логе `INFO [DRY-RUN] s3.put (bucket=orders-archive, key=orders/42.json, size=2048)`.
 
 **Что важно:** `guardWrite` — единственный канонический способ интегрироваться с dry-run.
+Сигнатур две: `guardWrite(label, args, dryRunDefault) { ... }` возвращает значение (под
+репетицией — `dryRunDefault`), `guardWrite(label, args) { ... }` — для void-записи. Значение
+`dryRunDefault` выбирай так, чтобы вызывающий код под репетицией шёл той же веткой, что и в
+бою: для HTTP-статуса это `200`, а не `0`; для «числа обновлённых строк» — `0`; для хендла —
+`null` только если вызывающий это переживает.
+
 Read-операции (`listKeys`, `getObject`) НЕ оборачивай в `guardWrite` — они должны работать
 под dry-run.
+
+### Хендл, который зовут внутри `forEach`
+
+`s3(client, bucket)` в примере выше создаёт новый `S3Ops` на каждый вызов. Пока он живёт
+в переменной над циклом — это ничего не стоит. Но если хендл дёргается прямо в теле
+`forEach` на миллионе item'ов и при этом что-то держит (соединение, буфер, счётчики),
+объекты нужно мемоизировать — для этого есть `MigrationContext.shared(key, factory)`:
+ресурс создаётся один раз на прогон для данного ключа и сразу регистрируется в реестре
+(runner закроет его в `finally`). Ровно так внутри устроены `kafka(producer)` и
+`topic(producer, name)`.
+
+```kotlin
+class S3Ops internal constructor(
+    private val ctx: MigrationContext,
+    private val client: S3Client,
+    private val bucket: String,
+) : AutoCloseable {                       // shared требует AutoCloseable
+
+    // ... put/delete/listKeys как выше
+
+    override fun close() {
+        // здесь финализируют multipart-upload'ы, флашат буферы и т.д.
+    }
+}
+
+/** Ключ мемоизации: идентичность клиента плюс имя бакета. */
+private data class S3Key(val client: S3Client, val bucket: String)
+
+fun MigrationContext.s3(client: S3Client, bucket: String): S3Ops =
+    shared(S3Key(client, bucket)) { S3Ops(this, client, bucket) }
+```
+
+Ограничение одно: `factory` не должна сама звать `shared` — вложенный вызов на той же
+мапе заблокируется.
 
 **Retry для S3 transient-ошибок** — навешивай на уровень `S3Client` (AWS SDK сам поддерживает
 `RetryPolicy` через `ClientOverrideConfiguration`). Item-level retry в DSL отсутствует
@@ -154,30 +198,38 @@ override fun MigrationContext.migrate() {
 
 ## 3. Кастомный Executor для `forEach`
 
-По умолчанию runner создаёт `Executors.newFixedThreadPool(migration.defaults.parallel)` с
-`ThreadFactory`, выставляющим `migration-<name>` имена. Хочешь свой пул (с MDC,
-metric'ами, или вообще `ForkJoinPool`) — публикуй `@Tag(MigrationExecutor::class) Executor`
-в графе:
+По умолчанию runner создаёт **cached**-пул (`Executors.newCachedThreadPool`) с daemon-потоками
+`migration-<name>-<n>`. Cached, а не fixed, — потому что реальное число воркеров задаёт
+аргумент `forEach(parallel = N)` через свой семафор, и пул обязан уметь выдать столько потоков,
+сколько попросили: иначе `parallel` был бы декорацией, а вложенный `forEach` вставал бы намертво
+на исчерпании фиксированного пула. `migration.defaults.parallel` на размер пула не влияет — это
+лишь значение аргумента `parallel` по умолчанию.
+
+Хочешь свой пул (с MDC, метриками, виртуальными потоками) — опубликуй в графе
+`Executor` с тегом `@Tag(MigrationExecutor::class)`. Фабрика должна жить в **`@Module`**:
+`@Component` вешается на класс-компонент, а метод-фабрику Kora ищет только в модулях.
 
 ```kotlin
-// com/example/migrations/CustomExecutor.kt
+// com/example/migrations/MigrationExecutorModule.kt
 package com.example.migrations
 
 import io.github.dsudomoin.migration.kora.MigrationExecutor
-import ru.tinkoff.kora.common.Component
+import ru.tinkoff.kora.common.Module
 import ru.tinkoff.kora.common.Tag
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
-@Component
-class MigrationExecutorFactory {
+@Module
+interface MigrationExecutorModule {
 
     @Tag(MigrationExecutor::class)
-    fun executor(): Executor {
-        return Executors.newFixedThreadPool(32) { r ->
+    fun migrationExecutor(): Executor {
+        val counter = AtomicInteger()
+        return Executors.newCachedThreadPool { r ->
             Thread(r).apply {
                 isDaemon = true
-                name = "mig-worker-${threadCounter.incrementAndGet()}"
+                name = "mig-worker-${counter.incrementAndGet()}"
                 uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, e ->
                     // свой обработчик — например, дёрнуть alert
                     System.err.println("Uncaught: $e")
@@ -185,21 +237,34 @@ class MigrationExecutorFactory {
             }
         }
     }
-
-    companion object {
-        private val threadCounter = java.util.concurrent.atomic.AtomicInteger()
-    }
 }
 ```
 
-Runner подхватит этот executor через `Optional<Executor>` инжект с `@Tag(MigrationExecutor::class)`.
-Если бин не зарегистрирован — runner создаст свой дефолтный.
+Модуль нужно добавить в список родителей `@KoraApp`, иначе граф о нём не узнает:
+
+```kotlin
+@KoraApp
+interface App : HoconConfigModule, MigrationModule, MigrationExecutorModule
+```
+
+Runner подхватит executor через `Optional<Executor>`-инжект с `@Tag(MigrationExecutor::class)`.
+Если бина нет — создаст свой дефолтный.
+
+Две вещи, о которых надо помнить, подменяя пул:
+
+- **Пул должен выдавать столько потоков, сколько просит самый жадный `forEach`.** Fixed-пул на
+  32 потока при `forEach(parallel = 64)` тихо ограничит параллелизм 32-мя, а вложенный
+  `forEach(parallel > 1)` на исчерпанном fixed-пуле может встать в deadlock. Cached или
+  virtual-threads пул этой проблемы не имеют.
+- **Свой пул runner не гасит.** Дефолтный он регистрирует как `AutoCloseable` и останавливает
+  сам (`shutdown()` + ожидание 30 с, потом `shutdownNow()` с предупреждением в отчёт). Кастомный
+  считается собственностью пользователя — закрывай его сам (например, `register(AutoCloseable { pool.shutdown() })`
+  в начале `migrate()`).
 
 Применения:
 - MDC propagation — твой `ThreadFactory` копирует `MDC.getCopyOfContextMap()` из main-thread.
-- Metrics-aware пул (`ThreadPoolExecutor` с `ScheduledThreadPoolExecutor` для прокидывания
-  active-tasks gauge в Prometheus).
-- `VirtualThreadPerTaskExecutor` для JDK 21+ скриптов с большим числом IO-ожиданий.
+- Metrics-aware пул (`ThreadPoolExecutor` + gauge на active-tasks в Prometheus).
+- `Executors.newVirtualThreadPerTaskExecutor()` для JDK 21+ скриптов с большим числом IO-ожиданий.
 
 ---
 
@@ -209,6 +274,15 @@ Runner подхватит этот executor через `Optional<Executor>` ин
 скрипта для составного лога. Полезно когда стандартного `"X/Y done"` мало.
 
 ```kotlin
+import io.github.dsudomoin.migration.Migration
+import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.OnError
+import io.github.dsudomoin.migration.Progress
+import io.github.dsudomoin.migration.error.includeItem
+import io.github.dsudomoin.migration.forEach
+import ru.tinkoff.kora.http.client.common.HttpClientResponseException
+import java.util.concurrent.atomic.AtomicLong
+
 class SampleMigration(...) : Migration("SAMPLE-001", "team") {
 
     private val ok = AtomicLong()
@@ -222,17 +296,19 @@ class SampleMigration(...) : Migration("SAMPLE-001", "team") {
         forEach(
             items,
             parallel = 8,
-            onError = OnError.handle { e, item ->
-                when (e) {
-                    is HttpClient4xxException -> {
+            onError = OnError.handle { e, _ ->
+                when {
+                    // Не-2xx от типизированного Kora-клиента прилетает как
+                    // HttpClientResponseException (у http(call) — как HttpStatusException).
+                    e is HttpClientResponseException && e.code in 400..499 -> {
                         processed4xx.incrementAndGet()
                         OnError.Decision.Skip
                     }
                     // 5xx ретраится Kora @Retry внутри HTTP-клиента; сюда попадает только
                     // финальный fail после исчерпания retries — аудитим и идём дальше.
-                    is HttpClient5xxException -> OnError.Decision.Skip
-                    is ValidationException    -> OnError.Decision.Skip
-                    else                      -> OnError.Decision.Fail
+                    e is HttpClientResponseException -> OnError.Decision.Skip
+                    e is ValidationException         -> OnError.Decision.Skip   // свой доменный тип
+                    else                             -> OnError.Decision.Fail
                 }
             },
             progress = Progress.Custom(500) { done, total ->
@@ -246,7 +322,8 @@ class SampleMigration(...) : Migration("SAMPLE-001", "team") {
                 process(item)
                 ok.incrementAndGet()
             } catch (e: Exception) {
-                if (e !is HttpClient4xxException) skipped.incrementAndGet()
+                val is4xx = e is HttpClientResponseException && e.code in 400..499
+                if (!is4xx) skipped.incrementAndGet()
                 throw e
             }
         }
@@ -283,13 +360,15 @@ class SampleMigration(...) : Migration("SAMPLE-001", "team") {
 | Кастомный HTTP-клиент (OkHttp / HttpURLConnection) | Передай `HttpCall` лямбду в `http(call)`. См. [http-backfill-archetype.md](http-backfill-archetype.md) §«Вариация: http()» |
 | Свой error-reporter (не CSV, а Kibana / Sentry) | `MigrationContext.errors` типизирован как конкретный `CsvFileErrorReporter` (а не интерфейс) — стандартный runner всегда даёт CSV. Чтобы заменить: либо `open` `CsvFileErrorReporter.report(...)` через subclass и подсунуть его в `DefaultMigrationContext.internalCreate(...)` в своём `Lifecycle`-компоненте; либо форкнуть `MigrationRunner` и интанцировать свой `ErrorReporter`-impl. Pluggable из коробки нет — это сознательное решение (см. AGENTS.md §15.2) |
 | Не-Kora приложение | Подключи только `migration-dsl-core` (без `migration-dsl-kora`), создавай `DefaultMigrationContext.internalCreate(...)` сам — фабрика на companion-объекте публичная |
+| Перехват exit-кода вместо `exitProcess` | Объяви в графе компонент `MigrationExit` (`fun interface MigrationExit { fun exit(code: Int) }`) — runner отдаст код в него и не убьёт JVM. Нужно тестам на настоящем графе и встраиванию runner'а в приложение, которое живёт дальше |
+| Программный конфиг без HOCON | `MigrationConfigValues` / `DefaultsValues` / `ErrorReportingValues` / `ReportValues` — data-классы с дефолтами, реализующие `MigrationConfig`. Удобны в тестах и при встраивании runner'а |
 
 ## Что НЕ стоит кастомизировать
 
 - **`ForEachEngine`** — internal-класс, сигнатуры могут меняться между minor-версиями
   без deprecation. Если кажется, что нужно — открой issue.
 - **`MigrationContext` сам по себе** (как интерфейс) — кастомные реализации сломаются на
-  следующей версии при добавлении новых членов в интерфейс. Используй [`DefaultMigrationContext`](../../core/src/main/kotlin/io/migration/internal/DefaultMigrationContext.kt)
+  следующей версии при добавлении новых членов в интерфейс. Используй [`DefaultMigrationContext`](../../core/src/main/kotlin/io/github/dsudomoin/migration/internal/DefaultMigrationContext.kt)
   через его фабрики.
 - **`Migration.migrate()` вне `MigrationContext`-receiver** — runner полагается на extension-receiver
   для прокидывания контекста. Не пытайся подменить.

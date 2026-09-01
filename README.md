@@ -50,6 +50,9 @@ MIGRATION_RUN=SAMPLE-001 ./gradlew run     # боевой
 MIGRATION_DRY_RUN=true MIGRATION_RUN=SAMPLE-001 ./gradlew run   # без записей
 ```
 
+Обе переменные работают только если проброшены в `application.conf` (`run` и
+`dryRun` — см. [Установку](#установка)).
+
 Получаешь в `logs/SAMPLE-001/`:
 - `migration.log` — всё, что писалось в slf4j,
 - `errors.csv` — order_id, попавшие в `Skip`-ветку,
@@ -72,11 +75,21 @@ MIGRATION_DRY_RUN=true MIGRATION_RUN=SAMPLE-001 ./gradlew run   # без зап�
 
 ```kotlin
 // build.gradle.kts
+plugins {
+    kotlin("jvm") version "2.1.20"
+    id("com.google.devtools.ksp") version "2.1.20-1.0.32"
+}
+
 dependencies {
     implementation("io.github.dsudomoin.migration:migration-dsl-core:0.1.0")
     implementation("io.github.dsudomoin.migration:migration-dsl-kora:0.1.0")
+
+    ksp("ru.tinkoff.kora:symbol-processors:1.1.25")
 }
 ```
+
+Кодогенерация Kora для Kotlin — только KSP. `kapt` с
+`ru.tinkoff.kora:annotation-processors` не поддерживается.
 
 В `@KoraApp`-интерфейсе подключи `MigrationModule`:
 
@@ -85,16 +98,43 @@ dependencies {
 interface App :
     HoconConfigModule,
     JdbcDatabaseModule,
-    KafkaProducerModule,
     MigrationModule
 ```
+
+Больше ничего подмешивать не нужно: секцию `migration { ... }` `MigrationModule`
+читает сам, а runner помечен `@Root` и создаётся графом без внешних зависимостей.
+Класса `KafkaProducerModule` в Kora не существует — для типизированного
+`@KafkaPublisher` достаточно артефакта `ru.tinkoff.kora:kafka` и KSP; сырой
+`Producer` для `kafka(...)` / `topic(...)` объявляешь своим `@Module`-компонентом
+(или берёшь у Kora-паблишера через `producer()`).
 
 В `application.conf`:
 ```hocon
 migration {
   run = ${?MIGRATION_RUN}
-  defaults { parallel = 1 }     # дефолт; подними под параллельный forEach
+  dryRun = ${?MIGRATION_DRY_RUN}   # без этой строки MIGRATION_DRY_RUN=true не включит репетицию
+  defaults { parallel = 1 }        # значение forEach(parallel = ...) по умолчанию
 }
+```
+
+Библиотека нигде не читает окружение сама (`System.getenv` в исходниках нет) —
+переменные приезжают только через `${?VAR}` в HOCON. Строку `dryRun` легко
+забыть, и тогда `MIGRATION_DRY_RUN=true ./gradlew run` спокойно уйдёт в бой.
+
+`defaults.parallel` — это дефолт аргумента `forEach(parallel = ...)`, а не размер
+пула: пул runner'а cached и выдаёт столько воркеров, сколько запросил конкретный
+цикл. `forEach(parallel = 8)` даст восемь потоков независимо от этого ключа.
+
+### Готовый рабочий пример
+
+В репозитории лежит модуль [`example/`](example) — работающее приложение-миграция
+(`@KoraApp` + `Migration` + `application.conf`), собранное ровно так, как собирался
+бы чужой сервис. Им же проверяется, что описанный выше wire-up действительно
+поднимается на настоящем графе Kora:
+
+```bash
+MIGRATION_RUN=CUSTOMER-TIER-001 ./gradlew :example:run                        # боевой
+MIGRATION_RUN=CUSTOMER-TIER-001 MIGRATION_DRY_RUN=true ./gradlew :example:run # репетиция
 ```
 
 Дальше — [гайд](docs/USER_GUIDE.md) и [примеры](#примеры).
@@ -119,6 +159,7 @@ migration {
 | HTTP backfill | DB → внешний HTTP с retry | [examples/http-backfill-archetype.md](docs/examples/http-backfill-archetype.md) |
 | **Full showcase** | Cassandra + Postgres tx + Kafka + HTTP + 3×CSV | [examples/full-showcase.md](docs/examples/full-showcase.md) |
 | **Customization** | Свои ops, AutoCloseable, Executor, Progress | [examples/customization.md](docs/examples/customization.md) |
+| **Рабочий модуль** | CSV → `mutation` → CSV, запускается `./gradlew :example:run` | [example/](example) |
 
 ## Архитектура
 
@@ -136,7 +177,9 @@ migration {
 
 - Kotlin **2.1+**, JVM **21+**.
 - Kora **1.1+** (для `migration-dsl-kora`).
-- Docker — только для integration-тестов самой либы; пользователю не нужен.
+- Docker — только для контейнерных тестов самой либы; они помечены `@Tag("docker")`
+  и по умолчанию исключены (`./gradlew build` проходит без Docker, прогнать их —
+  `./gradlew test -PwithDocker`). Пользователю библиотеки Docker не нужен.
 
 ## Лицензия
 

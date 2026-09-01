@@ -38,7 +38,7 @@
 // build.gradle.kts
 plugins {
     kotlin("jvm") version "2.1.20"
-    kotlin("kapt") version "2.1.20"
+    id("com.google.devtools.ksp") version "2.1.20-1.0.32"
     application
 }
 
@@ -51,18 +51,31 @@ dependencies {
     implementation("io.github.dsudomoin.migration:migration-dsl-kora:0.1.0")
 
     // Kora — подключай только те модули, которые реально используешь в скриптах
+    implementation("ru.tinkoff.kora:common:1.1.25")
+    implementation("ru.tinkoff.kora:config-common:1.1.25")
     implementation("ru.tinkoff.kora:config-hocon:1.1.25")
     implementation("ru.tinkoff.kora:application-graph:1.1.25")
-    implementation("ru.tinkoff.kora:database-jdbc:1.1.25")     // если нужен Postgres
+    implementation("ru.tinkoff.kora:database-jdbc:1.1.25")      // если нужен Postgres
     implementation("ru.tinkoff.kora:kafka:1.1.25")              // если нужна Kafka
     implementation("ru.tinkoff.kora:http-client-jdk:1.1.25")    // если нужен HTTP
 
     runtimeOnly("org.postgresql:postgresql:42.7.7")             // драйвер БД
     runtimeOnly("ch.qos.logback:logback-classic:1.5.16")        // logging backend
 
-    kapt("ru.tinkoff.kora:annotation-processors:1.1.25")
+    // Кодогенерация Kora для Kotlin — KSP. Другого пути нет.
+    ksp("ru.tinkoff.kora:symbol-processors:1.1.25")
 }
 ```
+
+**Только KSP, никакого kapt.** Для Kotlin Kora поддерживает единственный процессор —
+`ru.tinkoff.kora:symbol-processors`, подключаемый конфигурацией `ksp`. Связка
+`kotlin("kapt")` + `kapt("ru.tinkoff.kora:annotation-processors")` (как и голый
+`annotationProcessor(...)`) для Kotlin-проекта не работает: аннотации не обрабатываются,
+`@KoraApp`-граф не генерируется, сборка падает на отсутствующем `AppGraph`. Если такая связка
+осталась в проекте с прежних версий гайда — вычищай её целиком.
+
+Живой образец сборки потребителя — модуль [`example/build.gradle.kts`](../example/build.gradle.kts)
+в этом репозитории: он подключает библиотеку ровно так, как это сделает чужой сервис.
 
 ### `@KoraApp`
 
@@ -71,25 +84,34 @@ dependencies {
 @KoraApp
 interface App :
     HoconConfigModule,
-    JdbcDatabaseModule,
-    KafkaProducerModule,
-    JdkHttpClientModule,
-    MigrationModule
+    JdbcDatabaseModule,     // если нужен Postgres
+    JdkHttpClientModule,    // если нужен HTTP
+    MigrationModule         // всегда
 
 fun main() {
     KoraApplication.run { AppGraph.graph() }
 }
 ```
 
-`MigrationModule` нужен обязательно — через него runner попадает в граф. Остальные модули
-включай по потребности.
+Ради библиотеки нужна ровно одна строка — `MigrationModule`. Секцию `migration { ... }` модуль
+читает сам (внутри лежит собственная фабрика конфига), а runner помечен `@Root`, поэтому граф
+создаёт его без явных зависимостей. Никаких дополнительных модулей библиотеки подмешивать не надо.
+
+Остальное — по потребности скрипта: `JdbcDatabaseModule` (артефакт `database-jdbc`),
+`CassandraDatabaseModule` (`database-cassandra`), `JdkHttpClientModule` (`http-client-jdk`),
+`KafkaModule` (`kafka`, нужен если объявляешь `@KafkaPublisher`).
+
+> **`KafkaProducerModule` не существует.** Такого класса в Kora нет; если он остался в
+> `@KoraApp` со старых версий гайда — модуль просто не скомпилируется. Модуль Kafka называется
+> `KafkaModule`, а как достать raw `Producer` для `topic(...)` / `kafka(...)` — см. [§12](#12-kafka--topicproducer-name-и-kafkaproducerpublish).
 
 ### `application.conf`
 
 Минимум:
 ```hocon
 migration {
-  run = ${?MIGRATION_RUN}        # имя миграции, env-override
+  run    = ${?MIGRATION_RUN}       # имя миграции
+  dryRun = ${?MIGRATION_DRY_RUN}   # репетиция; без этой строки переменная не действует
 }
 
 db {
@@ -98,6 +120,13 @@ db {
   password = ${?DB_PASSWORD}
 }
 ```
+
+**Про `dryRun = ${?MIGRATION_DRY_RUN}` — это не украшение.** В библиотеке нет ни одного
+`System.getenv`: окружение читает HOCON, и только через явную подстановку `${?VAR}`. Если строки
+`dryRun` в конфиге нет, то `MIGRATION_DRY_RUN=true ./gradlew run` запустит **боевой** прогон —
+переменная останется никем не прочитанной, а `migration.dryRun` возьмёт значение по умолчанию
+`false`. Ровно та же логика у `run`, `outputFolder` и любого другого ключа: нет строки в
+`application.conf` — нет env-override.
 
 Полную форму конфига см. в [§14](#14-конфигурация-hocon).
 
@@ -141,27 +170,37 @@ class HelloMig(private val db: JdbcConnectionFactory) : Migration(name = "HELLO"
 - **`openCsv("ids.csv", "id")`** — открывает файл в [`outputFolder`](#16-outputfolder-и-артефакты-прогона)
   (по умолчанию `logs/HELLO/`), пишет header, регистрируется в ctx. Runner закроет в `finally`.
 - **`jdbc(db).query(...)`** — простой SELECT, возвращает `List<Long>`.
-- **`forEach(ids) { ... }`** — sequential обработка. Параллелизма по умолчанию нет.
+- **`forEach(ids) { ... }`** — число воркеров по умолчанию берётся из
+  `migration.defaults.parallel` (из коробки `1`, то есть sequential). Явный `parallel = N`
+  в вызове всегда сильнее конфига — см. [§5](#5-foreach--цикл-с-параллелизмом).
 
 ---
 
 ## 3. Запуск
 
 ```bash
-MIGRATION_RUN=HELLO ./gradlew run
+MIGRATION_RUN=HELLO ./gradlew run                          # боевой прогон
+MIGRATION_RUN=HELLO MIGRATION_DRY_RUN=true ./gradlew run   # репетиция (см. §15)
 ```
 
 Или из IDE — IntelliJ Run Configuration с env `MIGRATION_RUN=HELLO`.
+
+Обе переменные работают только потому, что в `application.conf` есть строки
+`run = ${?MIGRATION_RUN}` и `dryRun = ${?MIGRATION_DRY_RUN}` (см. [§1](#1-установка-и-подключение)).
 
 В консоль уйдёт лог + итоговый отчёт. В файловой системе появится `logs/HELLO/`:
 
 ```
 logs/HELLO/
 ├── migration.log     # всё, что писалось через slf4j во время прогона
-├── errors.csv        # пусто, если ошибок не было
-├── errors.log
-└── ids.csv           # наш output
+├── ids.csv           # наш output
+├── errors.csv        # создаётся ЛЕНИВО — только если была хотя бы одна ошибка
+└── errors.log        # стектрейсы к тем же ошибкам, тоже лениво
 ```
+
+`errors.csv` / `errors.log` появляются в момент первой записанной ошибки. Чистый прогон не
+оставляет ни пустых файлов, ни строк `Error details:` в отчёте — «файлов нет» здесь значит
+«ошибок не было».
 
 ---
 
@@ -171,15 +210,19 @@ logs/HELLO/
 
 | Свойство | Тип | Что |
 |---|---|---|
-| `dryRun` | `Boolean` | `true` если запущено с `MIGRATION_DRY_RUN=true` |
+| `dryRun` | `Boolean` | `true` если `migration.dryRun` = true (обычно через `dryRun = ${?MIGRATION_DRY_RUN}`) |
 | `log` | `slf4j.Logger` | Логгер `io.github.dsudomoin.migration.<имя_миграции>` — пиши сюда свои INFO/WARN/DEBUG |
 | `report` | `ReportBuilder` | Счётчики прогона. Обычно дёргают только в `Progress.Custom { ... }` для кастомных метрик |
-| `executor` | `Executor` | Пул потоков для `forEach`. Обычно сами не используешь |
+| `executor` | `Executor` | Пул потоков для `forEach`. Runner создаёт **cached** pool. Обычно сам не используешь |
 | `outputFolder` | `Path` | Путь к папке артефактов (см. [§16](#16-outputfolder-и-артефакты-прогона)) |
+| `defaultParallel` | `Int` | Значение `parallel` у `forEach` по умолчанию. Из `migration.defaults.parallel` |
+| `defaultProgressEvery` | `Int` | Период `Progress.Default`. Из `migration.defaults.progressEvery` |
+| `errorThreshold` | `Long` | Порог SKIP-ов, после которого прогон прерывается. Из `migration.defaults.errorThreshold`, `0` = выключено |
 | `errors` | `CsvFileErrorReporter` | Авто-аудитор. Используется в основном для `errors.includeItem<T> { ... }` (см. [§17](#17-errorscsv-и-errorsincludeitemt)) |
 
 Доступны методы:
-- `register(closeable)` — зарегистрировать свой `AutoCloseable` для авто-close после `migrate()`. Обычно сама либа делает это за тебя (через `openCsv`/`topic`).
+- `register(closeable)` — зарегистрировать свой `AutoCloseable` для авто-close после `migrate()`. Закрытие идёт в обратном порядке регистрации. Обычно сама либа делает это за тебя (через `openCsv`/`topic`).
+- `shared(key) { factory() }` — ресурс, единственный на прогон для данного ключа: первый вызов создаёт и регистрирует, последующие отдают тот же инстанс. На этом построены `kafka(producer)` и `topic(producer, name)`, поэтому их безопасно звать прямо в теле `forEach` — реестр не растёт по объекту на item. Пригодится и для своих op-обёрток.
 - `guardWrite(label, args, action)` — низкоуровневый dry-run gate. Снова, чаще всего сделано внутри DSL.
 - `auditError(e, item)` — ручной вызов аудитора. В обычной жизни не нужен.
 
@@ -187,7 +230,7 @@ logs/HELLO/
 
 ## 5. `forEach` — цикл с параллелизмом
 
-Три перегрузки:
+Четыре перегрузки: item-by-item и chunked, каждая — для `Iterable` и для `Sequence`.
 
 ### 5.1. Single-item
 
@@ -210,6 +253,14 @@ forEach(items, chunk = 500, parallel = 4, onError = OnError.Skip) { batch: List<
 - bulk-insert/update эффективнее;
 - хочешь меньше round-trip'ов в HTTP API.
 
+Для `Iterable`-источника разбиение материализует весь `List<List<T>>` до первой обработанной
+пачки (сам источник и так в памяти, но пик потребления удваивается). Для потоковых источников
+бери `Sequence`-перегрузку — она режет **лениво** и держит в памяти только текущий батч:
+
+```kotlin
+forEach(readCsv(path) { it }, chunk = 500, parallel = 4) { batch -> ... }
+```
+
 ### 5.3. `Sequence`-источник
 
 ```kotlin
@@ -229,8 +280,8 @@ forEach(items, parallel = 4, onError = OnError.Skip) { id ->
 ```kotlin
 forEach(
     items,
-    chunk = 500,                              // для chunked-перегрузки
-    parallel = 8,                             // потоков обработки. Дефолт 1
+    chunk = 500,                              // только у chunked-перегрузок, дефолта нет
+    parallel = 8,                             // воркеров. Дефолт — defaultParallel
     onError = OnError.Skip,                   // что делать при ошибке. Дефолт OnError.Fail
     onErrorLog = { e, item ->                 // доп. лог при ошибке (помимо авто-аудита). Дефолт null
         log.warn("Failed item=$item: ${e.message}")
@@ -238,11 +289,40 @@ forEach(
     logEach = { item ->                       // лог после успешной обработки. Дефолт null
         "Processed item=$item"
     },
-    progress = Progress.Custom(1000) { done, total ->  // прогресс-лог
+    progress = Progress.Custom(1000) { done, total ->  // прогресс-лог. Дефолт Progress.Default
         "$done/$total processed"
     },
 ) { item -> ... }
 ```
+
+| Параметр | Тип | Дефолт | Что |
+|---|---|---|---|
+| `items` | `Iterable<T>` / `Sequence<T>` | — | источник |
+| `chunk` | `Int` | — (обязателен у chunked-перегрузок) | размер батча; блок получает `List<T>` |
+| `parallel` | `Int` | `defaultParallel` (`migration.defaults.parallel`, из коробки `1`) | число воркеров. `<= 0` → `IllegalArgumentException` |
+| `onError` | `OnError` | `OnError.Fail` | политика на ошибку item'а (см. [§6](#6-onerror--политика-обработки-ошибок)) |
+| `onErrorLog` | `((Throwable, T) -> Unit)?` | `null` | доп. лог при ошибке |
+| `logEach` | `((T) -> String)?` | `null` | строка в INFO-лог после успешного item'а |
+| `progress` | `Progress` | `Progress.Default` | прогресс-лог (см. [§7](#7-progress--прогресс-логирование)) |
+
+У chunked-перегрузок `T` в `onErrorLog` / `logEach` / блоке — это `List<T>`: единицей учёта
+(и в `report.processed`, и в прогрессе) становится батч, а не отдельный элемент.
+
+### Про параллелизм
+
+- `parallel = N` даёт **ровно N одновременно работающих воркеров**. Пул runner'а — cached, он
+  выдаёт столько потоков, сколько попросил конкретный цикл; число одновременных задач держит
+  семафор самого `forEach`. Раньше потолком был размер общего фиксированного пула (по умолчанию
+  один поток), и `parallel = 8` был декорацией — примеры в старом гайде обещали параллелизм,
+  которого не было.
+- `parallel = 1` (дефолт из коробки) исполняется прямо в вызывающем потоке, минуя executor.
+- Вложенный `forEach(parallel > 1)` внутри другого параллельного `forEach` работает и **не
+  встаёт в deadlock** — на фиксированном пуле это был вечный вис.
+- `migration.defaults.parallel` задаёт только **значение аргумента по умолчанию**: явный
+  `parallel = N` в коде всегда сильнее конфига.
+- Диагностические колбэки не влияют на судьбу item'а: исключение из `logEach` / `onErrorLog`
+  больше не превращает успешный item в отказ (и не обрывает прогон под `OnError.Fail` уже
+  после выполненной записи). Про первый такой сбой уходит предупреждение в отчёт, дальше молча.
 
 > **Про retry.** Item-уровневого retry в DSL **нет** — это сознательный выбор
 > (item-retry повторяет всё тело `forEach`-блока, что ломает non-idempotent
@@ -380,6 +460,31 @@ val ids = readCsv(Path.of("/data/input.csv")) { it["id"]!! }.toList()
 forEach(readCsv(path) { ... }, ...) { row -> ... }
 ```
 
+### `onRowError` — политика на битую строку
+
+Обе перегрузки принимают `onRowError: OnError` (дефолт `OnError.Fail`):
+
+```kotlin
+readCsv(path, classpath = false, onRowError = OnError.Skip) { row -> ... }
+readCsv(Path.of("/data/input.csv"), onRowError = OnError.Skip) { row -> ... }
+```
+
+Политика применяется к **каждой строке отдельно** и покрывает обе возможные беды: разбор
+самого CSV (рваные кавычки, лишние колонки) и работу твоего mapper'а
+(`row.getValue("spend").toLong()` на пустой ячейке).
+
+- `OnError.Fail` (дефолт) — первая же плохая строка валит прогон. Прежнее поведение.
+- `OnError.Skip` / `OnError.handle { ... -> Decision.Skip }` — строка уезжает в `errors.csv`,
+  инкрементит `report.skipped` (то есть считается в `errorThreshold`) и до `forEach` не доходит.
+
+Это важнее, чем кажется: раньше ошибка mapper'а летела **мимо** `OnError` цикла и валила весь
+прогон, хотя export-архетип обещал обратное. Теперь обещание выполнимо — но только если
+`onRowError` передан явно.
+
+Открытый поток регистрируется в контексте, поэтому недопотреблённая `Sequence` (`take(n)`,
+ранний выход, исключение выше по стеку) не оставляет открытый файловый дескриптор — runner
+закроет его в `finally`.
+
 ---
 
 ## 9. Запись CSV — `openCsv`
@@ -395,10 +500,11 @@ val nested    = openCsv("by-date/2026.csv", "id", "amount")  // подкатал
 val external  = openCsv(Path.of("/shared/export.csv"), "id", "name")
 ```
 
-`openCsv` возвращает [`CsvOutput`](../core/src/main/kotlin/io/migration/csv/CsvWrite.kt) — handle с одним методом:
+`openCsv` возвращает [`CsvOutput`](../core/src/main/kotlin/io/github/dsudomoin/migration/csv/CsvWrite.kt) — handle с двумя методами:
 
 ```kotlin
 fun row(vararg cells: Any?)
+fun flush()                  // сбросить буфер, не закрывая файл
 ```
 
 Что важно:
@@ -454,6 +560,17 @@ jdbc(db).stream(
 Параметры — named placeholders `:name`. Биндинг через `setObject` — Kora/Postgres сам приводит
 типы для большинства случаев. Для специфических — кастуй явно: `"since"::timestamp`.
 
+> **`query` и `stream` принимают только читающие запросы.** Первое ключевое слово должно быть
+> `select` / `with` / `show` / `explain` / `values` / `table` / `describe`, иначе —
+> `IllegalArgumentException` ещё до похода в базу. Причина простая: ни `query`, ни `stream` не
+> проходят dry-run gate (и не должны — чтение под репетицией обязано работать), поэтому
+> `query("insert ... returning id")` выполнялся бы **в бою во время dry-run прогона**.
+> Нужны строки от пишущего запроса — бери `executeReturning` (ниже). Проверка одинакова в обоих
+> режимах: гейт, срабатывающий только под dry-run, дал бы зелёную репетицию при падающем бое.
+>
+> Известное ограничение: `WITH ... INSERT` (data-modifying CTE) начинается с `with` и проверку
+> пройдёт — такие запросы тоже отправляй в `executeReturning`.
+
 ### Запись
 
 ```kotlin
@@ -469,7 +586,18 @@ jdbc(db).batch("insert into log(id, msg) values (?, ?)", entries) { ps, entry ->
 }
 ```
 
-`execute` и `batch` идут через `guardWrite` — под dry-run пропускаются, в отчёте видны.
+```kotlin
+// Пишущий запрос, возвращающий строки: INSERT/UPDATE ... RETURNING
+val ids = jdbc(db).executeReturning(
+    "insert into orders(customer_id) values (:c) returning id",
+    "c" to customerId,
+) { rs -> rs.getLong("id") }
+```
+
+`execute`, `batch` и `executeReturning` идут через `guardWrite` — под dry-run пропускаются, в
+отчёте видны (метки `jdbc.execute`, `jdbc.batch`, `jdbc.executeReturning`). Под dry-run
+`execute` возвращает `0`, `batch` — пустой `IntArray`, `executeReturning` — пустой список
+(mapper при этом не вызывается: строк, которые ему можно отдать, не существует).
 
 ### Транзакция
 
@@ -481,11 +609,43 @@ transactional(jdbc(db)) {
 }
 ```
 
-Внутри блока `this: SqlOps` — `execute/query/batch` без префикса. Все они используют один
-`Connection`, открытый через `db.inTx` Kora. Commit на успехе, rollback на исключении.
+Внутри блока `this: SqlOps` — `execute/query/batch/executeReturning` без префикса. Все они
+используют один `Connection`, открытый через `db.inTx` Kora. Commit на успехе, rollback на
+исключении.
 
 **Вложенный `transactional` бросает `IllegalStateException`** — нет smart-merge с outer-tx,
-автор должен явно решить, что делать.
+автор должен явно решить, что делать. Проверка работает **и под dry-run**: раньше она была
+отключена в режиме репетиции, то есть dry-run проходил зелёным ровно там, где боевой прогон
+падал. Ловятся оба случая: вложенный вызов на tx-bound `SqlOps` и вызов с внешним free-mode
+`ops` изнутри уже открытой транзакции.
+
+**Транзакционный `SqlOps` привязан к потоку, который открыл транзакцию.** `java.sql.Connection`
+не потокобезопасен, а вот это компилируется и выглядит безобидно:
+
+```kotlin
+// НЕЛЬЗЯ: четыре воркера полезут в один Connection
+transactional(jdbc(db)) {
+    forEach(orders, parallel = 4) { o -> execute("update orders set ... where id = :id", "id" to o.id) }
+}
+```
+
+Теперь такой код падает с внятным `IllegalStateException` («tx-bound jdbc ops used from thread
+... but the transaction belongs to ...») вместо тихой порчи данных. Правильный порядок —
+транзакция **внутри** тела цикла:
+
+```kotlin
+forEach(orders, parallel = 4) { o ->
+    transactional(jdbc(db)) {
+        execute("update orders set status = 'PROCESSING' where id = :id", "id" to o.id)
+        execute("insert into order_audit(order_id, event) values (:id, 'process_start')", "id" to o.id)
+    }
+}
+```
+
+**Под dry-run `transactional` не пропускает блок целиком.** Тело выполняется: чтения работают,
+а отдельные записи внутри него скипаются каждая своим `guardWrite`. Реальный `Connection` при
+этом не открывается (не нужен BEGIN/COMMIT round-trip на каждый блок), в отчёт идёт метка
+`jdbc.transactional`.
 
 ---
 
@@ -515,9 +675,10 @@ Multi-кластерная миграция — два разных `CqlSession`
 
 ## 12. Kafka — `topic(producer, name)` и `kafka(producer).publish`
 
-В Kora канонический способ публиковать — **типизированный `@KafkaPublisher`**-интерфейс.
-Raw `Producer<K, V>` доступен через `@Tag(SomePublisher::class)` инжект, но используется
-реже. Ниже — три способа интегрировать миграцию с Kafka в зависимости от ситуации.
+В Kora канонический способ публиковать — **типизированный `@KafkaPublisher`**-интерфейс:
+объявляешь контракт, процессор генерирует реализацию. DSL-хендлы `topic(...)` / `kafka(...)`
+работают поверх «сырого» `org.apache.kafka.clients.producer.Producer`, который в графе надо
+завести самому (см. способ 2). Ниже — три способа, в порядке убывания частоты применения.
 
 ### Способ 1: `@KafkaPublisher.Topic` + `mutation { }` (рекомендуемый)
 
@@ -550,10 +711,18 @@ kafka.orders.publisher {
 }
 ```
 
+Чтобы `@KafkaPublisher` сгенерировался, в `@KoraApp` нужен `KafkaModule` (артефакт
+`ru.tinkoff.kora:kafka`) и KSP-процессор из [§1](#1-установка-и-подключение).
+
 `mutation("label", args = ...) { ... }` оборачивает вызов в dry-run gate. **`label` —
 константа** (`"orders.resync"`), чтобы в `report.dryRunSkipped` получился чистый агрегат
 `mutation:orders.resync: 8421`. **`args` — диагностика** для лога (`(orderId=42)` в каждой
 INFO-строке).
+
+Обёртка здесь не формальность: типизированный публишер — обычный компонент графа, DSL про него
+ничего не знает и сам перехватить вызов не может. Без `mutation { }` репетиция отправит
+сообщения по-настоящему; единственный признак — предупреждение «intercepted 0 writes» в отчёте
+(см. [§15](#15-dry-run)).
 
 Плюсы: типизированный API, `@Json` сериализация автоматом, имя топика в HOCON
 (env-override возможен). Минусы: для каждого `mutation { publisher.method() }` нет
@@ -561,33 +730,55 @@ batch-flush-coordination (Kora-генерированный метод — sync 
 
 ### Способ 2: raw `Producer<K, V>` + `topic(...)` handle
 
-Когда хочется явный handle с авто-flush на закрытии (одна короткая папка на топик).
-Раз `@KafkaPublisher` регистрирует `Producer<K, V>` тэгом своего интерфейса, его можно достать:
+Когда хочется явный handle со счётчиками DSL и авто-`flush()` на закрытии. Нужен «сырой»
+`Producer<K, V>` — Kora такой бин сама по себе не публикует, поэтому его либо объявляют
+компонентом графа:
 
 ```kotlin
-@KafkaPublisher("kafka.orders.publisher")
-interface OrdersPublisher {
-    fun send(record: ProducerRecord<String, OrderEvent>)  // нужно хотя бы одну сигнатуру для типов K,V
+@Module
+interface OrdersProducerModule {
+
+    fun ordersProducer(config: MyKafkaConfig): Producer<String, ByteArray> = KafkaProducer(
+        mapOf("bootstrap.servers" to config.brokers(), "acks" to "all"),
+        StringSerializer(),
+        ByteArraySerializer(),
+    )
 }
 
 @Component
-class Task(
-    @Tag(OrdersPublisher::class) private val producer: Producer<String, OrderEvent>,
-) : Migration(...) {
+class Task(private val producer: Producer<String, ByteArray>) : Migration(...) {
     override fun MigrationContext.migrate() {
-        val resync = topic(producer, "orders.resync")    // регистрируется в ctx, auto-flush на close
+        // Продюсер создан нами — нам его и закрывать: DSL делает flush(), но не close().
+        register(AutoCloseable { producer.close() })
+
+        val resync = topic(producer, "orders.resync")
         forEach(orders) { order ->
-            resync.send(order.id.toString(), OrderEvent.from(order))
+            resync.send(order.id.toString(), encode(order))
         }
     }
 }
 ```
 
-`KafkaTopic.send(...)` — sync publish (`producer.send(...).get()`). Под dry-run возвращает
-`null`, в отчёт идёт `kafka.publish` с разбивкой по topic+key.
+…либо берут у уже объявленного Kora-публишера: сгенерированная реализация отдаёт свой
+`producer()` — но типы там `Producer<ByteArray, ByteArray>`, то есть сериализация ключа и
+значения остаётся на тебе.
 
-Плюсы: одна точка подачи топика, `flush()` один раз в `finally`. Минусы: нужно знать K/V типы
-заранее, нет `@Json`-сахара (сериализатор передаёшь через ProducerConfig напрямую).
+Порядок в примере не случаен: ресурсы закрываются в **обратном** порядке регистрации, поэтому
+`register { producer.close() }` до `topic(...)` гарантирует, что продюсер закроется последним —
+уже после `flush()` хендла.
+
+`KafkaTopic.send(...)` — sync publish (`producer.send(...).get()`). Под dry-run возвращает
+`null`, в отчёт идёт `kafka.publish` с разбивкой по topic+key. Есть и
+`KafkaTopic.sendAsync(key, value)` — то же, но без ожидания ack (про учёт — ниже).
+
+Хендл мемоизирован: `topic(producer, "orders.resync")` на пару (продюсер, имя) отдаёт один и
+тот же объект, поэтому его можно звать хоть прямо в теле `forEach` — реестр ресурсов не
+разрастётся. `close()` (его вызывает runner в `finally`) делает `producer.flush()`, сам
+`Producer` не закрывает.
+
+Плюсы: одна точка подачи топика, `flush()` один раз в `finally`, счётчики и dry-run-метки без
+ручной обёртки. Минусы: нужно знать K/V типы заранее и нет `@Json`-сахара — сериализатор
+задаёшь через конфиг продюсера.
 
 ### Способ 3: `kafka(producer).publish/publishAsync` ad-hoc
 
@@ -601,22 +792,35 @@ kafka(producer).publish("orders.audit",  key, auditEvent)
 val future = kafka(producer).publishAsync("orders.resync", key, value)
 ```
 
-Sync-вариант блокируется на ack, async — возвращает `CompletableFuture`. Оба под dry-run
-ничего не отправляют, инкрементят `report.dryRunSkipped["kafka.publish"]`.
+`kafka(producer)` тоже мемоизирован (по продюсеру), так что вызов в теле цикла ничего не плодит.
+Sync-вариант блокируется на ack, async — возвращает `CompletableFuture`. Оба под dry-run ничего
+не отправляют и инкрементят `report.dryRunSkipped` (`kafka.publish` / `kafka.publishAsync`).
+
+**Про учёт async-доставки.** `forEach` засчитывает item успешным в момент отправки, а брокер
+отвечает позже — и возвращаемый future в реальных скриптах почти никто не читает. Поэтому отказ
+доставки обрабатывается в самом callback'е: строка уходит в `errors.csv`, растёт счётчик
+`report.asyncFailed`, в отчёте появляется строка `✗ Async delivery failed`, а runner поднимает
+exit-код до `1` (см. [§21](#21-exit-коды)). Раньше сообщение терялось молча при уже засчитанном
+успешном item'е.
+
+Чтобы к моменту печати отчёта все callback'и успели отработать, закрытие хендла делает
+`flush()` — то есть считать `asyncFailed` можно после прогона, цифра финальная. Если отказы
+были, в `warnings` отчёта уедет ещё и строка `kafka.publishAsync: N message(s) were rejected
+by the broker`.
 
 ### Что выбирать
 
 | Сценарий | Способ |
 |---|---|
 | Один скрипт, один топик, типизированный value (`@Json`) | **1** — `@KafkaPublisher.Topic` + `mutation` |
-| Высокая нагрузка, один топик, нужен явный flush-handle | **2** — raw `Producer` + `topic(...)` |
+| Высокая нагрузка, один топик, нужен явный flush-handle и счётчики DSL | **2** — raw `Producer` + `topic(...)` |
 | Несколько топиков ad-hoc, без оверкилла | **3** — `kafka(producer).publish(...)` |
 
 ---
 
 ## 13. HTTP — типизированный клиент + `mutation` + `http(call)`
 
-Есть три способа сделать HTTP-вызов из миграции.
+Есть два способа сделать HTTP-вызов из миграции.
 
 ### Способ 1: типизированный Kora `@HttpClient` (рекомендуемый)
 
@@ -641,7 +845,7 @@ mutation("auth.refresh", args = mapOf("userId" to userId)) {
 }
 ```
 
-Под dry-run [мутация](../core/src/main/kotlin/io/migration/Mutation.kt) **не выполнится**, в лог пойдёт
+Под dry-run [мутация](../core/src/main/kotlin/io/github/dsudomoin/migration/Mutation.kt) **не выполнится**, в лог пойдёт
 `INFO [DRY-RUN] mutation:auth.refresh (userId=42)`, в отчёт — `report.dryRunSkipped["mutation:auth.refresh"]` (агрегат
 по константному label'у; если бы label включал `$userId`, в отчёте было бы по записи на каждого юзера).
 
@@ -661,35 +865,60 @@ http(call).post("/v1/users/42/refresh", body = ...)
 http(call).get("/v1/users/42")
 ```
 
-Write-методы (`post/patch/put/delete`) идут через dry-run gate автоматом. Read (`get`) — нет.
+Write-методы (`post/patch/put/delete`) идут через dry-run gate автоматом (метки `http.post`,
+`http.patch`, `http.put`, `http.delete`). Read (`get`) — нет, выполняется всегда.
+
+### Код ответа проверяется всегда
+
+Любой статус вне `200..299` поднимает `HttpStatusException(method, path, status)` — и у `get`, и
+у всех write-методов. Без этого мёртвый бэкенд, отвечающий 500 на каждый запрос, дал бы отчёт
+«100 000 successful» при нулевом эффекте бэкфилла: `HttpCall` возвращает просто `Int`, и без
+проверки код 500 выглядел бы как удачная обработка item'а.
+
+Исключение штатно доходит до `OnError` и до `errors.csv`, поэтому политику по коду ответа
+пишут прямо в цикле:
+
+```kotlin
+forEach(
+    users,
+    onError = OnError.handle { e, _ ->
+        if (e is HttpStatusException && e.status == 409) OnError.Decision.Skip else OnError.Decision.Fail
+    },
+) { user -> http(call).post("/v1/users/${user.id}/refresh") }
+```
+
+Под dry-run write-методы возвращают `200`, а не `0`: вызывающий код почти всегда смотрит на
+статус, и ноль отправил бы репетицию в ветку ошибки — dry-run обязан идти тем же путём, что и
+бой.
 
 ---
 
 ## 14. Конфигурация HOCON
 
-Все поля опциональные, кроме `migration.run`.
+Секция `migration { ... }` целиком опциональна — у каждого ключа есть значение по умолчанию.
+Без `migration.run` runner просто ничего не делает (idle).
 
 ```hocon
 migration {
   # Имя миграции к запуску. null = runner idle (полезно когда сервис ещё и API хостит).
   run = ${?MIGRATION_RUN}
 
-  # Dry-run: все write-операции пропускаются, в отчёт идёт разбивка skipped writes.
+  # Dry-run: write-операции через guardWrite пропускаются, в отчёт идёт разбивка skipped writes.
   dryRun = false
   dryRun = ${?MIGRATION_DRY_RUN}
 
-  # Папка для артефактов. null → logs/${migration.run}.
+  # Папка для артефактов. null → logs/<имя миграции>.
   outputFolder = ${?MIGRATION_OUTPUT_FOLDER}
 
   defaults {
-    onUnhandled    = FAIL_FAST           # FAIL_FAST | LOG_AND_COMPLETE
+    onUnhandled    = FAIL_FAST            # FAIL_FAST | LOG_AND_COMPLETE
     errorThreshold = 0                    # >0 — exit 1 если skipped > threshold
     progressEvery  = 1000                 # период дефолтного Progress.Default
-    parallel       = 1                    # дефолтный размер ThreadPool runner'а; подними под параллельный forEach
+    parallel       = 1                    # значение аргумента parallel у forEach по умолчанию
   }
 
   errorReporting {
-    includeStackTrace = true              # writeать ли стектрейсы в errors.log
+    includeStackTrace = true              # писать ли стектрейсы в errors.log
     maxItemReprLength = 500               # обрезать itemRepr в errors.csv до этой длины
   }
 
@@ -699,7 +928,50 @@ migration {
 }
 ```
 
-Env-overrides через `${?VAR}` — стандартный HOCON-синтаксис.
+| Ключ | Тип | Дефолт | Что |
+|---|---|---|---|
+| `run` | `String?` | `null` | имя миграции (совпадает с `Migration(name = ...)`). `null` — runner idle |
+| `dryRun` | `Boolean` | `false` | репетиция без записей (см. [§15](#15-dry-run)) |
+| `outputFolder` | `String?` | `null` → `logs/<имя миграции>` | папка артефактов. Тип именно `String`, не `Path` |
+| `defaults.onUnhandled` | `FAIL_FAST` / `LOG_AND_COMPLETE` | `FAIL_FAST` | политика на исключение вне `forEach`; перебивается аргументом `Migration(onUnhandled = ...)` |
+| `defaults.errorThreshold` | `Long` | `0` (выключен) | если `skipped > threshold` — прогон прерывается, exit 1 |
+| `defaults.progressEvery` | `Int` | `1000` | период `Progress.Default` |
+| `defaults.parallel` | `Int` | `1` | **значение аргумента `parallel` у `forEach` по умолчанию** |
+| `errorReporting.includeStackTrace` | `Boolean` | `true` | писать ли `errors.log` |
+| `errorReporting.maxItemReprLength` | `Int` | `500` | обрезка `itemRepr` в `errors.csv` |
+| `report.asciiOnly` | `Boolean` | `false` | ASCII-рендер отчёта для CI без UTF-8 |
+
+Значения проверяются на старте: `parallel <= 0`, `progressEvery <= 0`, `errorThreshold < 0`,
+`maxItemReprLength <= 0` — это мисконфиг, runner пишет в лог конкретный ключ и завершается с
+кодом `2`, не начиная прогон.
+
+Env-overrides через `${?VAR}` — стандартный HOCON-синтаксис, и **единственный** способ дотянуться
+до окружения: `System.getenv` в библиотеке не вызывается нигде. Нет строки `ключ = ${?VAR}` —
+переменная не действует.
+
+### `defaults.parallel` сменил смысл
+
+Раньше этот ключ задавал размер фиксированного пула потоков runner'а, и он же был потолком
+параллелизма: при `parallel = 1` в конфиге вызов `forEach(parallel = 8)` всё равно работал в
+один поток. Теперь ключ задаёт **значение аргумента `parallel` по умолчанию**, а пул runner'а —
+cached и выдаёт столько воркеров, сколько запросил конкретный цикл.
+
+Что это значит на практике:
+- `forEach(parallel = 8)` даёт восемь воркеров независимо от конфига;
+- поднимать `defaults.parallel` нужно только если хочешь, чтобы **все** циклы без явного
+  аргумента шли параллельно;
+- `defaults.parallel = 1` (дефолт) — по-прежнему безопасная последовательная обработка.
+
+### Конфиг библиотеки — интерфейс, а не data class
+
+`MigrationConfig` объявлен как `@ConfigValueExtractor interface` с default-методами (доступ
+методами: `config.run()`, `config.defaults().parallel()`), а экстрактор приезжает вместе с
+`MigrationModule`. Пользователю это менять не нужно — важно только следствие: **никаких
+дополнительных модулей ради конфига подключать не надо**, HOCON-ключи те же.
+
+Для программной сборки конфига без HOCON (тесты, встраивание runner'а) есть data-классы
+`MigrationConfigValues`, `DefaultsValues`, `ErrorReportingValues`, `ReportValues` — см.
+[§20](#20-тестирование-скриптов).
 
 ### Кастомный конфиг скрипта
 
@@ -723,6 +995,11 @@ data class SampleConfig(
 `var` — Kora требует setter'ов. Поля без default'ов — обязательные, отсутствие в HOCON
 = ошибка на старте.
 
+Осторожно с дефолтами в Kotlin: KSP **не видит** значений по умолчанию у параметров конструктора
+(`var batchSize: Int = 200` всё равно станет обязательным ключом). Если ключ должен быть
+опциональным — объявляй конфиг интерфейсом с default-методами, как это сделано у самой
+библиотеки.
+
 ---
 
 ## 15. Dry-run
@@ -731,25 +1008,46 @@ data class SampleConfig(
 MIGRATION_RUN=SAMPLE-001 MIGRATION_DRY_RUN=true ./gradlew run
 ```
 
+Работает это только если в `application.conf` есть строка `dryRun = ${?MIGRATION_DRY_RUN}` —
+иначе переменную никто не прочитает и прогон пойдёт боевым (см. [§1](#1-установка-и-подключение)).
+
 Что происходит:
-- **Read-операции** (`jdbc.query/stream`, `cassandra.query/stream`, `readCsv`, типизированный
-  `@HttpClient` GET) — выполняются обычно.
-- **Write через DSL** (`jdbc.execute`, `cassandra.execute`, `kafka.publish`, `topic.send`,
-  `mutation { }`, `http(call).post`) — **не** выполняются. В лог `INFO [DRY-RUN] <label> ...`,
-  в отчёт `report.dryRunSkipped[label] += 1`.
+- **Read-операции** (`jdbc.query/stream`, `cassandra.query/stream`, `readCsv`, `http(call).get`,
+  типизированный `@HttpClient` GET) — выполняются обычно.
+- **Write через DSL** (`jdbc.execute`, `jdbc.batch`, `jdbc.executeReturning`,
+  `cassandra.execute`, `kafka.publish`, `topic.send`, `mutation { }`, `http(call).post`) —
+  **не** выполняются. В лог `INFO [DRY-RUN] <label> ...`, в отчёт
+  `report.dryRunSkipped[label] += 1`. Возвращается нейтральное значение: `execute` → `0`,
+  `executeReturning` → пустой список, `publish` → `null`, HTTP-write → `200`.
+- **`transactional { }`** — блок **выполняется**, реальный `Connection` не открывается,
+  пропускаются отдельные записи внутри него. Запрет вложенного `transactional` под dry-run
+  тоже действует (см. [§10](#10-postgres--jdbc--jdbcdb-и-transactional)).
 - **`openCsv` файлы** — пишутся (диагностический артефакт).
 
 В отчёте под dry-run появится дополнительная строка:
 ```
-  ⌀ Dry-run skipped writes: (jdbc.execute: 1947000, kafka.publish: 973500, mutation:auth.refresh: 147)
+  ⌀ Dry-run skipped writes:    (jdbc.execute: 1947000, kafka.publish: 973500, mutation:auth.refresh: 147)
 ```
 
 Из этой строки видно: сколько именно UPDATE/INSERT улетело бы в БД, сколько в Kafka, и т.д.
 Готовая оценка масштаба перед боевым прогоном.
 
 **Что НЕ под dry-run-gate:**
-- Кастомный код, который ты пишешь сам без обёрток (например, вручную создаёшь `KafkaProducer`
-  и шлёшь). Не делай так. Оборачивай в `mutation("...") { ... }` или используй DSL-функции.
+- Кастомный код, который ты пишешь сам без обёрток: вызов repository-метода, типизированного
+  `@KafkaPublisher` или `@HttpClient`, вручную созданный `KafkaProducer`. DSL про эти вызовы
+  ничего не знает и перехватить их не может — под репетицией они выполняются **по-настоящему**.
+  Оборачивай в `mutation("...") { ... }` или используй DSL-функции.
+
+Забытый `mutation { }` — самый дорогой тихий промах, поэтому у него есть наблюдаемый признак:
+если под dry-run обработан хоть один item, но не перехвачено ни одной записи, runner пишет WARN
+в лог и в `warnings` отчёта:
+
+```
+DRY-RUN processed 8393 item(s) but intercepted 0 writes. If this migration writes anything,
+those writes went through FOR REAL — wrap typed client calls in mutation("label") { ... }
+```
+
+Увидел эту строку в репетиции — считай, что прогон был боевым, и разбирайся до повтора.
 
 ---
 
@@ -758,12 +1056,21 @@ MIGRATION_RUN=SAMPLE-001 MIGRATION_DRY_RUN=true ./gradlew run
 ```
 logs/SAMPLE-001/
 ├── migration.log          # slf4j root logger — всё, что писалось в JVM за время прогона
-├── errors.csv             # авто-аудит item-уровневых ошибок
-├── errors.log             # стектрейсы по тем же ошибкам
 ├── processed.csv          # твои openCsv(...) — каждый свой файл
 ├── failed.csv
+├── errors.csv             # авто-аудит item-уровневых ошибок — ЛЕНИВО, с первой ошибки
+├── errors.log             # стектрейсы по тем же ошибкам — тоже лениво
 └── ...
 ```
+
+`errors.csv` и `errors.log` создаются **не всегда**: аудитор открывает их в момент первой
+записанной ошибки. Прогон без единого SKIP-а не оставляет пустых файлов, и строк
+`Error details:` / `Error traces:` в отчёте тоже не будет.
+
+Обратная сторона: если ошибки были в **прошлом** прогоне, а в текущем их нет — старые файлы
+никто не перезапишет (перезапись происходит при первой ошибке), и отчёт покажет `Error details:`
+со ссылкой на вчерашние данные. Хочешь чистую картину — чисти папку между прогонами или задавай
+`MIGRATION_OUTPUT_FOLDER` с timestamp'ом.
 
 Папка определяется так (в порядке приоритета):
 
@@ -771,9 +1078,10 @@ logs/SAMPLE-001/
 2. Env-override `MIGRATION_OUTPUT_FOLDER`.
 3. Дефолт `logs/${migration.name}` относительно JVM CWD.
 
-Создаётся (`mkdir -p`) на старте runner'ом. Все файлы внутри `TRUNCATE`-аются при ререн —
-один прогон = один набор артефактов. Если нужна история — заархивируй папку после прогона
-(или подставь timestamped путь через env).
+Создаётся (`mkdir -p`) на старте runner'ом. Файлы `TRUNCATE`-аются при ререн — один прогон =
+один набор артефактов: `migration.log` и `openCsv`-файлы в момент открытия, `errors.csv` /
+`errors.log` — в момент первой ошибки (см. выше). Если нужна история — заархивируй папку после
+прогона (или подставь timestamped путь через env).
 
 В `migrate()` доступна как `outputFolder: Path` — удобно для своих файлов:
 
@@ -801,8 +1109,11 @@ Runner программно подключает logback `FileAppender` к **roo
 
 ```csv
 timestamp,migration,author,itemRepr,errorClass,errorMessage
-2026-05-15T13:42:11Z,SAMPLE-001,team,"Order(id=42, customerId=cust-1)",NetworkException,timeout
+2026-05-15T10:42:11.318Z,SAMPLE-001,team,"Order(id=42, customerId=cust-1)",NetworkException,timeout
 ```
+
+`timestamp` — ISO-8601 в **UTC**. В итоговом отчёте времена печатаются в зоне JVM со смещением
+(`2026-05-15 13:42:11 +03:00`) — именно затем, чтобы одно с другим сходилось без гадания.
 
 `itemRepr` по умолчанию — `item.toString()`. Для data class это нормально, для строк-id
 тоже. Для `Map`-объектов и больших структур — не очень.
@@ -833,36 +1144,63 @@ override fun MigrationContext.migrate() {
 ```
 ═══════════════════════════════════════════════════════════
 Migration: SAMPLE-001  (author: team)
-Started:   2026-05-15 13:40:00
-Finished:  2026-05-15 13:47:15
+Started:   2026-05-15 13:40:00 +03:00
+Finished:  2026-05-15 13:47:15 +03:00
 Duration:  7m 15s
 Mode:      REAL
 ───────────────────────────────────────────────────────────
 Processed:                 8 393
   ✓ Successful:            8 380
-  ⊘ Skipped (errors):          13
-  ✗ Failed:                     0
+  ⊘ Skipped (errors):      13
+  ✗ Failed:                0
 ───────────────────────────────────────────────────────────
-Error details:  logs/SAMPLE-001/errors.csv  (13 rows)
+Error details:  logs/SAMPLE-001/errors.csv
 Error traces:   logs/SAMPLE-001/errors.log
 ═══════════════════════════════════════════════════════════
 ```
 
+Разбор строк:
+
+- **Started / Finished** — со смещением зоны (`+03:00`). Зона — та, в которой живёт JVM;
+  смещение печатается затем, чтобы метки сходились с `errors.csv`, который пишет UTC.
+- **Duration** — человекочитаемо: `45s`, `7m 15s`, `2h 3m 11s`.
+- **Mode** — `REAL` или `DRY-RUN`.
+- **Processed** — item'ов (или батчей, если `forEach` с `chunk`). Числа от 1000 разделяются
+  пробелом.
+- **Error details / Error traces** — печатаются только если файлы существуют, то есть если была
+  хотя бы одна ошибка (см. [§16](#16-outputfolder-и-артефакты-прогона)). Количества строк в
+  отчёте нет — смотри `Skipped`.
+
+Если были отказы асинхронной доставки в Kafka, добавляется строка (**только когда значение
+больше нуля** — постоянного нуля в отчёте нет):
+```
+  ✗ Async delivery failed:  17
+```
+Это сообщения, которые брокер отверг уже после того, как item был засчитан успешным. Они не
+входят в `Failed`, но поднимают exit-код до `1` (см. [§21](#21-exit-коды)).
+
 Под dry-run:
 ```
-  ⌀ Dry-run skipped writes: (jdbc.execute: 16 842, kafka.publish: 8 421)
+  ⌀ Dry-run skipped writes:    (jdbc.execute: 16842, kafka.publish: 8421)
 ```
+Разбивка отсортирована по label'у, поэтому отчёты двух прогонов сравнимы построчно. Пробелами
+разделяются только счётчики сверху (`8 393`); внутри разбивки числа печатаются как есть.
 
-Если при закрытии ресурсов что-то падало — появится блок:
+Если при закрытии ресурсов что-то падало (или runner заметил что-то подозрительное) — появится
+блок:
 ```
   ⚠ Warnings:
     - resource close failed: KafkaTopic(orders.resync) (TimeoutException: flush timed out)
 ```
 
-Warnings — нефатальные. На exit-code не влияют. Появляются только если у тебя в скрипте есть
-ресурсы с проблемным `close()`.
+Сюда же уезжают: предупреждение про dry-run без единой перехваченной записи
+([§15](#15-dry-run)), отказы async-доставки, невставший за 30 секунд пул потоков (с числом
+брошенных задач) и отсутствие logback на classpath.
 
-В CI без UTF-8 терминала включай `migration.report.asciiOnly = true`.
+Warnings — нефатальные. На exit-code не влияют.
+
+В CI без UTF-8 терминала включай `migration.report.asciiOnly = true` — глифы заменяются на
+`[OK]` / `[SK]` / `[FL]` / `[!]` / `[--]`, рамки на `=` и `-`.
 
 ---
 
@@ -875,9 +1213,13 @@ Warnings — нефатальные. На exit-code не влияют. Появ�
 class Task : Migration(
     name = "TASK-X",
     author = "you",
-    onUnhandled = ScriptPolicy.LOG_AND_COMPLETE,  // дефолт FAIL_FAST
+    onUnhandled = ScriptPolicy.LOG_AND_COMPLETE,  // не задан → migration.defaults.onUnhandled
 )
 ```
+
+Аргумент `onUnhandled` по умолчанию `null` — тогда политику берут из
+`migration.defaults.onUnhandled` (из коробки `FAIL_FAST`). Заданный в коде аргумент сильнее
+конфига.
 
 - **`FAIL_FAST`** (дефолт) — залогировать, инкрементить `report.failed`, exit-code 1. Уместно
   когда «не пишем дальше».
@@ -922,9 +1264,68 @@ class Task42000Test {
   последовательного прогона) — собирай контекст напрямую через
   `DefaultMigrationContext.internalCreate(...)`.
 - `outputFolder` — если не передал, создаст в системной tmp.
+- Принимает те же дефолты, что и конфиг: `dryRun`, `defaultParallel`, `defaultProgressEvery`,
+  `errorThreshold` — так тестируют поведение под репетицией и под порогом ошибок.
 
-Для **integration-тестов** реальных операций (JDBC/Cassandra/Kafka) — используй Testcontainers,
-как сделано в `kora/src/test/.../SqlOpsIntegrationTest.kt` и пр.
+### Конфиг в тестах — без HOCON
+
+Когда тест поднимает настоящий граф или конструирует `MigrationRunner` руками, конфиг собирают
+data-классами:
+
+```kotlin
+val config = MigrationConfigValues(
+    run = "SAMPLE-001",
+    dryRun = true,
+    outputFolder = tmp.toString(),
+    defaults = DefaultsValues(parallel = 4, errorThreshold = 10),
+)
+```
+
+Есть и `ErrorReportingValues`, `ReportValues` — у всех дефолты совпадают с HOCON-дефолтами.
+
+Чтобы прогон не убил JVM тест-раннера `exitProcess`'ом, положи в граф компонент
+`MigrationExit` — runner отдаст код возврата в него:
+
+```kotlin
+@Component
+class TestExit : MigrationExit {
+    override fun exit(code: Int) { Probe.exitCode = code }
+}
+```
+
+Без такого компонента поведение прежнее — runner завершает процесс.
+
+### Контейнерные тесты — под тегом `docker`
+
+Тесты на реальных JDBC/Cassandra/Kafka помечены `@Tag("docker")` и **по умолчанию исключены**:
+обычный `./gradlew build` проходит на машине без Docker. Прогнать их:
+
+```bash
+./gradlew test -PwithDocker
+```
+
+Образцы — `kora/src/test/.../ops/SqlOpsIntegrationTest.kt`, `KafkaOpsIntegrationTest.kt`,
+`CassandraOpsIntegrationTest.kt`. Тем же тегом стоит помечать и собственные контейнерные тесты.
+
+### Модуль `:example` — рабочий образец
+
+В репозитории есть модуль [`example/`](../example) — целое приложение-миграция, собранное ровно
+так, как соберётся чужой сервис (KSP, `@KoraApp : HoconConfigModule, MigrationModule`, `@Component`-
+миграция, `application.conf`). Это одновременно и шаблон для копирования, и проверка того, что
+документированный wire-up действительно работает на настоящем графе Kora:
+
+- `example/src/main/kotlin/.../ExampleApp.kt` — `@KoraApp`, `main()`, компонент-репозиторий;
+- `example/src/main/kotlin/.../BackfillCustomerTier.kt` — миграция `CUSTOMER-TIER-001`
+  (`readCsv(onRowError = Skip)` + `forEach(parallel = 4)` + `mutation { }` + `openCsv`);
+- `example/src/test/kotlin/.../KoraWireUpTest.kt` — тесты на сборку графа, реальный параллелизм,
+  отсутствие deadlock'а во вложенном `forEach`, проброс `dryRun` и коды возврата.
+
+Запуск:
+
+```bash
+MIGRATION_RUN=CUSTOMER-TIER-001 ./gradlew :example:run                        # боевой прогон
+MIGRATION_RUN=CUSTOMER-TIER-001 MIGRATION_DRY_RUN=true ./gradlew :example:run # репетиция
+```
 
 ---
 
@@ -932,25 +1333,51 @@ class Task42000Test {
 
 | Код | Что значит |
 |---|---|
-| `0` | Success. Включая `LOG_AND_COMPLETE`-сценарии (где было unhandled-исключение, но runner довёл до конца). |
-| `1` | `FAIL_FAST` от unhandled-исключения **или** `errorThreshold` превышен. |
-| `2` | Misconfiguration: unknown migration name, дубликат имён в графе. |
+| `0` | Success. Включая `LOG_AND_COMPLETE`-сценарии (было unhandled-исключение, но runner довёл прогон до конца). Без `migration.run` runner вообще не трогает код возврата: процесс живёт дальше по своим правилам. |
+| `1` | `FAIL_FAST` от unhandled-исключения; `errorThreshold` превышен (проверка и в реальном времени внутри `forEach`, и post-mortem в конце); были отказы async-доставки в Kafka (`report.asyncFailed > 0`). |
+| `2` | Мисконфиг — прогон не начинался: неизвестное имя миграции; дубликат имён `Migration` в графе; недопустимые значения конфига (`defaults.parallel <= 0`, `defaults.progressEvery <= 0`, `defaults.errorThreshold < 0`, `errorReporting.maxItemReprLength <= 0`); не удалось создать `outputFolder`. |
+
+Отказы async-доставки поднимают код до `1` уже после того, как тело миграции отработало: они
+прилетают в callback'ах продюсера и учитываются на `flush()` при закрытии хендла. Прогон,
+потерявший сообщения, не имеет права закончиться нулём.
 
 Прод-инфраструктура (CI/CD, K8s Job) должна читать exit-code и решать ретраить/алертить.
+
+Если код возврата нужно перехватить вместо завершения процесса (тесты, встраивание runner'а в
+живущее дальше приложение) — положи в граф компонент `MigrationExit`, см.
+[§20](#20-тестирование-скриптов).
 
 ---
 
 ## 22. Шпаргалка-FAQ
 
 **Q: Как пропустить миграцию через env, не правя HOCON?**
-A: `MIGRATION_RUN= ./gradlew run` (пустое значение = `null` через `${?MIGRATION_RUN}`).
+A: Просто не передавай `MIGRATION_RUN` — тогда ключа `migration.run` в конфиге нет, он `null`,
+runner идёт в idle. На пустое значение (`MIGRATION_RUN= ./gradlew run`) рассчитывать нельзя:
+`${?VAR}` пропускает подстановку только для **неопределённой** переменной, а определённая, но
+пустая, подставится пустой строкой — и runner будет искать миграцию с пустым именем.
 
-**Q: Почему `transactional` не работает по сценарию X?**
-A: До v0.2 это был маркер без реального scope. С v0.2 — real tx через `db.inTx`. Если ставишь
-свежую либу — должно работать.
+**Q: Поставил `MIGRATION_DRY_RUN=true`, а прогон всё равно писал в базу. Почему?**
+A: Потому что в `application.conf` не было строки `dryRun = ${?MIGRATION_DRY_RUN}`. Библиотека
+не читает окружение сама — это делает HOCON, и только по явной подстановке. Проверь §1, а перед
+боем смотри строку `Mode:` в отчёте: под репетицией там `DRY-RUN`.
+
+**Q: Почему `query("insert ... returning id")` больше не работает?**
+A: Так и задумано: `query`/`stream` принимают только читающие запросы, потому что они не проходят
+dry-run gate — такой «read» выполнялся бы в бою во время репетиции. Пиши
+`executeReturning(...)` — он проходит гейт как обычная запись и под dry-run возвращает пустой
+список. См. §10.
+
+**Q: Почему `transactional { forEach(...) }` падает с `IllegalStateException`?**
+A: `java.sql.Connection` не потокобезопасен, а транзакционный `SqlOps` привязан к потоку,
+открывшему транзакцию. Разверни конструкцию: `forEach(...) { transactional(jdbc(db)) { ... } }`.
+Вложенный `transactional` тоже запрещён — и в бою, и под dry-run. См. §10.
 
 **Q: Как кастомизировать ThreadFactory у `forEach`?**
-A: Опубликуй свой `Executor`-бин с `@Tag(MigrationExecutor::class)`. Runner подхватит.
+A: Опубликуй свой `Executor`-бин с `@Tag(MigrationExecutor::class)`. Runner подхватит и не будет
+его гасить (это твой ресурс). Учти: реальный параллелизм ограничен возможностями твоего пула —
+если это `newFixedThreadPool(2)`, то `forEach(parallel = 8)` получит два воркера, а вложенный
+параллельный `forEach` может встать намертво. Дефолтный (cached) пул этой проблемы не имеет.
 
 **Q: Как делать миграцию idempotent на повторе?**
 A: На уровне SQL — `INSERT ... ON CONFLICT DO NOTHING`, `WHERE NOT EXISTS`. На уровне DSL —
@@ -971,7 +1398,13 @@ A: Два разных `CqlSession` в графе с `@Tag`, `@Tag(Primary::clas
 
 **Q: Что если в одном скрипте нужно несколько Kafka producer (разные кластеры)?**
 A: Два разных `Producer<...>` бина с `@Tag`, конструктор скрипта — два параметра, два `topic(p1, "...")`
-и `topic(p2, "...")` сверху `migrate()`.
+и `topic(p2, "...")`. Хендлы мемоизируются по паре (продюсер, имя), так что звать их можно и в
+теле цикла — объектов не прибавится.
+
+**Q: Отчёт зелёный, но в Kafka сообщений меньше, чем items. Где смотреть?**
+A: Строка `✗ Async delivery failed` в отчёте (печатается только когда значение > 0) и сами
+отказы в `errors.csv`. `publishAsync` / `sendAsync` считают item успешным в момент отправки,
+поэтому отказ доставки учитывается отдельным счётчиком и поднимает exit-код до 1. См. §12 и §21.
 
 **Q: `mutation { }` и retry совместимы?**
 A: В DSL item-level retry нет (см. §6 «Retry — на другом уровне»). Если хочешь ретраить
@@ -989,8 +1422,8 @@ inline**, до коммита tx. Если потом tx откатится — 
 **не делать publish внутри tx**, выноси за пределы.
 
 **Q: Тесты подтягивают `logback-classic`. А в проде нужно?**
-A: Да. Иначе runner залогирует warn `Logback не на classpath — migration.log file output отключён`
-и `migration.log` не появится. Лучше держать `runtimeOnly("ch.qos.logback:logback-classic:...")`.
+A: Да. Иначе runner залогирует warn `migration.log file output disabled: Logback not on classpath`
+(он же уедет в `warnings` отчёта), и `migration.log` не появится. Лучше держать `runtimeOnly("ch.qos.logback:logback-classic:...")`.
 
 **Q: Хочу свой S3-клиент / Redis / etc — как добавить в DSL?**
 A: Пишешь свой extension `MigrationContext.myOps(client)` с обёрткой над `guardWrite` для
@@ -1001,6 +1434,6 @@ A: `@Component class { @Tag(MigrationExecutor::class) fun executor(): Executor =
 Runner подхватит. См. [examples/customization.md §3](examples/customization.md#3-кастомный-executor-для-foreach).
 
 **Q: Хочу свой формат отчёта об ошибках (JSON / Kibana) вместо CSV — как?**
-A: Сложнее. `CsvFileErrorReporter` сейчас захардкожен в `MigrationRunner.init()`. Если нужно
+A: Сложнее. `CsvFileErrorReporter` сейчас захардкожен в `MigrationRunner`. Если нужно
 — можно сделать decorator над `DefaultMigrationContext` через свой `internalCreate`-аналог
 (`internalCreate` публичный). Открой issue или подумаем как сделать pluggable.
