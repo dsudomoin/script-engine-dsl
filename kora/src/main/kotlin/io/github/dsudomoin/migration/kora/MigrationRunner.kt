@@ -4,12 +4,12 @@ import ch.qos.logback.classic.LoggerContext
 import ch.qos.logback.classic.encoder.PatternLayoutEncoder
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.FileAppender
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.MigrationDefinition
+import io.github.dsudomoin.migration.MigrationPlan
 import io.github.dsudomoin.migration.ScriptPolicy
 import io.github.dsudomoin.migration.error.CsvFileErrorReporter
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
-import io.github.dsudomoin.migration.internal.ErrorThresholdExceeded
+import io.github.dsudomoin.migration.internal.RunContext
+import io.github.dsudomoin.migration.internal.PlanInterpreter
 import io.github.dsudomoin.migration.report.ReportBuilder
 import io.github.dsudomoin.migration.report.ReportFormatter
 import org.slf4j.Logger
@@ -38,7 +38,7 @@ import kotlin.system.exitProcess
  * 4. Создание `outputFolder`, attach logback `FileAppender` к root-логгеру.
  * 5. Создание [io.github.dsudomoin.migration.error.CsvFileErrorReporter], [io.github.dsudomoin.migration.report.ReportBuilder],
  *    `Executor` (из `@Tag(MigrationExecutor)` или дефолт-FixedThreadPool).
- * 6. Запуск `migrate()` в try/catch (политика по [Migration.onUnhandled]).
+ * 6. Исполнение плана интерпретатором в try/catch (политика по [MigrationPlan.onUnhandled]).
  * 7. В `finally`: `ctx.closeRegistered()` (все user-registered ресурсы), потом reporter.close().
  * 8. Печать отчёта в лог, exit с кодом 0 / 1 / 2.
  *
@@ -52,7 +52,7 @@ import kotlin.system.exitProcess
  */
 class MigrationRunner(
     private val config: MigrationConfig,
-    private val migrations: List<Migration>,
+    private val definitions: List<MigrationDefinition>,
     private val customExecutor: Executor?,
     private val exit: (Int) -> Unit = { exitProcess(it) },
 ) : Lifecycle {
@@ -73,9 +73,9 @@ class MigrationRunner(
         if (!requireUniqueNames()) return
         if (!validateConfig()) return
 
-        val migration = migrations.firstOrNull { it.name == name }
-        if (migration == null) {
-            val available = migrations.joinToString(", ") { it.name }
+        val definition = definitions.firstOrNull { it.name == name }
+        if (definition == null) {
+            val available = definitions.joinToString(", ") { it.name }
             log.error("Unknown migration '$name'. Available: [$available]")
             exit(2)
             return
@@ -84,11 +84,11 @@ class MigrationRunner(
         // Создание папки вынесено под обработку ошибки: битый путь в HOCON или отсутствие прав
         // иначе пробили бы init() насквозь необработанным IOException — мимо заявленных exit-кодов.
         val outputFolder = try {
-            val folder = config.outputFolder()?.let { Paths.get(it) } ?: Paths.get("logs", migration.name)
+            val folder = config.outputFolder()?.let { Paths.get(it) } ?: Paths.get("logs", definition.name)
             Files.createDirectories(folder)
             folder
         } catch (e: Exception) {
-            log.error("Cannot create migration.outputFolder '${config.outputFolder() ?: "logs/${migration.name}"}'", e)
+            log.error("Cannot create migration.outputFolder '${config.outputFolder() ?: "logs/${definition.name}"}'", e)
             exit(2)
             return
         }
@@ -97,33 +97,39 @@ class MigrationRunner(
         // того, как finally закрыл fileLogHandle (детач + stop FileAppender'а). Если бы exit
         // стоял внутри try, System.exit прервал бы текущий thread до finally, и последние
         // строки отчёта могли бы не доехать на диск (FileAppender буферизирован).
-        val code = executeMigration(migration, outputFolder)
+        val code = executeMigration(definition, outputFolder)
         exit(code)
     }
 
-    private fun executeMigration(migration: Migration, outputFolder: Path): Int {
+    private fun executeMigration(definition: MigrationDefinition, outputFolder: Path): Int {
         val errorsFile = outputFolder.resolve("errors.csv")
         val traceFile = outputFolder.resolve("errors.log")
-        val report = ReportBuilder(migration.name, migration.author, config.dryRun())
+        val plan = try {
+            definition.plan()
+        } catch (e: Exception) {
+            log.error("Cannot build plan of migration '${definition.name}'", e)
+            return 2
+        }
+
+        val report = ReportBuilder(plan.name, plan.author, config.dryRun())
         val fileLogHandle = attachFileLogger(outputFolder, report)
         try {
             val reporter = CsvFileErrorReporter(
-                migration.name, migration.author,
+                plan.name, plan.author,
                 errorsFile, traceFile,
                 maxItemReprLength = config.errorReporting().maxItemReprLength(),
                 includeStackTrace = config.errorReporting().includeStackTrace(),
             )
-            // Cached, а не fixed: реальный параллелизм задаёт `forEach(parallel = N)` через
+            // Cached, а не fixed: реальный параллелизм задаёт `source(parallel = N)` через
             // свой семафор, и пул обязан уметь выдать N потоков — иначе `parallel` был бы
-            // декорацией, а вложенный forEach вставал бы намертво на исчерпании фиксированного
-            // пула. Потоки daemon и переиспользуются, простаивающие отмирают сами.
+            // декорацией. Потоки daemon и переиспользуются, простаивающие отмирают сами.
             val threadNo = AtomicInteger()
             val executor = customExecutor ?: Executors.newCachedThreadPool { r ->
-                Thread(r, "migration-${migration.name}-${threadNo.incrementAndGet()}").apply { isDaemon = true }
+                Thread(r, "migration-${plan.name}-${threadNo.incrementAndGet()}").apply { isDaemon = true }
             }
-            val ctx = DefaultMigrationContext.internalCreate(
+            val ctx = RunContext.internalCreate(
                 dryRun = config.dryRun(),
-                name = migration.name,
+                name = plan.name,
                 report = report,
                 executor = executor,
                 outputFolder = outputFolder,
@@ -140,7 +146,7 @@ class MigrationRunner(
             }
 
             var code = try {
-                runMigration(migration, ctx)
+                runMigration(plan, ctx)
             } finally {
                 // Закрываем в обратном порядке создания: сначала юзер-ресурсы (CSV, Kafka-topic
                 // handle, executor) через ctx, потом — наш auto-аудитор. Если что-то в блоке
@@ -155,13 +161,13 @@ class MigrationRunner(
             // CsvFileErrorReporter создаёт файлы лениво (только на первой ошибке). Если миграция
             // прошла без SKIP-ок — файлов нет; не показываем «Error details: <путь>» с дохлым
             // путём в финальном отчёте.
-            // Забытый `mutation { }` — самый дорогой тихий промах библиотеки: под dry-run прямой
-            // вызов репозитория или паблишера мимо guardWrite выполняется по-настоящему. Наблюдаемый
+            // Забытый `write { }` — самый дорогой тихий промах библиотеки: под dry-run прямой
+            // вызов репозитория или паблишера мимо гейта выполняется по-настоящему. Наблюдаемый
             // признак ровно один — пустой breakdown при непустом processed. Делаем его громким.
             if (config.dryRun() && report.processedCount() > 0 && report.noWritesGated()) {
                 val msg = "DRY-RUN processed ${report.processedCount()} item(s) but intercepted 0 writes. " +
                     "If this migration writes anything, those writes went through FOR REAL — " +
-                    "wrap typed client calls in mutation(\"label\") { ... }"
+                    "wrap typed client calls in write(\"label\") { ... }"
                 log.warn(msg)
                 report.addWarning(msg)
             }
@@ -169,9 +175,11 @@ class MigrationRunner(
             // Отказы доставки прилетают асинхронно и учитываются в момент flush'а продюсера,
             // то есть уже после того, как runMigration вернул код. Прогон, потерявший сообщения,
             // не имеет права закончиться нулём.
-            val asyncFailed = report.asyncFailedCount()
-            if (asyncFailed > 0 && code == 0) {
-                log.error("$asyncFailed message(s) failed to deliver asynchronously; see errors.csv")
+            // Отправленное, но неподтверждённое, обязано поднимать код возврата независимо от
+            // ScriptPolicy: LOG_AND_COMPLETE не должен превращать потерянные сообщения в ноль.
+            val unconfirmed = report.unconfirmedEffectsCount()
+            if (unconfirmed > 0 && code == 0) {
+                log.error("$unconfirmed async effect(s) were never confirmed; see the report")
                 code = 1
             }
 
@@ -189,7 +197,7 @@ class MigrationRunner(
 
     /**
      * Останов собственного пула. `shutdown()` + ожидание вместо голого `shutdownNow()`: к этому
-     * моменту `migrate()` уже вернулся, но асинхронные хвосты (callback'и продюсера, задачи,
+     * моменту план уже исполнен, но асинхронные хвосты (callback'и продюсера, задачи,
      * досылаемые из пользовательских ресурсов при закрытии) ещё могут доигрывать. Если за
      * [SHUTDOWN_WAIT_SECONDS] пул не встал — гасим принудительно и поднимаем это в отчёт,
      * иначе потеря задач осталась бы невидимой.
@@ -241,7 +249,7 @@ class MigrationRunner(
     }
 
     private fun requireUniqueNames(): Boolean {
-        val dups = migrations.groupingBy { it.name }.eachCount().filter { it.value > 1 }
+        val dups = definitions.groupingBy { it.name }.eachCount().filter { it.value > 1 }
         if (dups.isNotEmpty()) {
             log.error("Duplicate migration names: ${dups.keys}")
             exit(2)
@@ -250,20 +258,17 @@ class MigrationRunner(
         return true
     }
 
-    private fun runMigration(migration: Migration, ctx: MigrationContext): Int {
+    private fun runMigration(plan: MigrationPlan, ctx: RunContext): Int {
         return try {
-            with(ctx) { migration.run { migrate() } }
+            PlanInterpreter(ctx).execute(plan)
             // Post-mortem threshold check на случай, если миграция дошла до конца естественно,
             // но количество skipped к этому моменту перевалило за порог. Realtime-check внутри
-            // forEach обычно ловит первым.
+            // Стадия обычно ловит первой.
             val thr = config.defaults().errorThreshold()
             if (thr > 0 && ctx.report.skippedCount() > thr) {
                 log.error("Error threshold exceeded: skipped=${ctx.report.skippedCount()} > $thr")
                 1
             } else 0
-        } catch (e: ErrorThresholdExceeded) {
-            log.error(e.message)
-            1
         } catch (e: Throwable) {
             // Безопасный аудит — если errors.csv недоступен, не теряем оригинальный e.
             try {
@@ -275,14 +280,14 @@ class MigrationRunner(
                 )
             }
             ctx.report.incFailed()
-            val policy = migration.onUnhandled ?: config.defaults().onUnhandled()
+            val policy = plan.onUnhandled ?: config.defaults().onUnhandled()
             when (policy) {
                 ScriptPolicy.FAIL_FAST -> {
-                    log.error("Migration ${migration.name} FAILED", e); 1
+                    log.error("Migration ${plan.name} FAILED", e); 1
                 }
 
                 ScriptPolicy.LOG_AND_COMPLETE -> {
-                    log.error("Migration ${migration.name} failed (LOG_AND_COMPLETE)", e); 0
+                    log.error("Migration ${plan.name} failed (LOG_AND_COMPLETE)", e); 0
                 }
             }
         }

@@ -13,14 +13,14 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Авто-аудитор item-уровневых ошибок. Пишет CSV-строку в [errorsFile] и стектрейс в [tracesFile]
- * для каждой ошибки, прошедшей через `OnError.Skip` / `handle→Skip` в `forEach`.
+ * для каждой ошибки, прошедшей через `ItemError.Skip` / `Handle→Skip` в стадии.
  *
  * Файлы создаются лениво (на первой ошибке) — если миграция пройдёт без ошибок, файлов не будет.
- * Доступен на [io.github.dsudomoin.migration.MigrationContext.errors]; пользователь обычно вызывает только
+ * Доступен на [io.github.dsudomoin.migration.RunScope.errors]; пользователь обычно вызывает только
  * [includeItem] для per-type сериализации, всё остальное — автоматика.
  *
  * **Thread-safe.** [report] и [registerSerializer] безопасно вызывать из параллельных воркеров
- * `forEach`. [includeItem] фактически делегирует в [registerSerializer].
+ * стадии. [includeItem] фактически делегирует в [registerSerializer].
  *
  * @param maxItemReprLength максимальная длина строки `itemRepr` в CSV. Длинные значения
  *                          обрезаются с `...`. Дефолт 500.
@@ -63,8 +63,8 @@ open class CsvFileErrorReporter(
      * Lookup в [report] идёт сначала точно по классу, потом по супертипам и интерфейсам —
      * `includeItem<Map>` сработает и для `LinkedHashMap`.
      *
-     * **Регистрируй сериализаторы в начале `migrate()`, до первого `forEach`.** Метод thread-safe,
-     * но регистрация во время параллельной `forEach`-итерации (когда воркеры уже могли закешировать
+     * **Регистрируй сериализаторы в `items { }`, до первой обработки.** Метод thread-safe,
+     * но регистрация во время параллельной обработки (когда воркеры уже могли закешировать
      * resolved-сериализаторы) приводит к инвалидации кэша и transient cache miss — корректность
      * не страдает, но рендеринг item'а в `errors.csv` может на нескольких записях пойти через
      * `toString()` вместо нового сериализатора, пока кэш не перестроится.
@@ -78,7 +78,7 @@ open class CsvFileErrorReporter(
 
     /**
      * Записать ошибку в `errors.csv` + (опционально) стектрейс в `errors.log`. Уже вызывается
-     * автоматически из `forEach`-движка и [io.github.dsudomoin.migration.MigrationContext.auditError].
+     * автоматически интерпретатором плана и [io.github.dsudomoin.migration.RunScope.auditError].
      *
      * **Thread-safe, сериализуется через общий lock.** Все воркеры пишут в общий файл через
      * `synchronized(writeLock)`. На типичном error rate (десятки в минуту) это незаметно; если

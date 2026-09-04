@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
@@ -39,7 +39,7 @@ class SqlOpsGuardTest {
 
     @Test
     fun `query отказывается выполнять пишущий запрос`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
 
         val thrown = catchThrowable {
             with(ctx) { jdbc(db).query("insert into orders(id) values (1) returning id") { it.getLong(1) } }
@@ -54,7 +54,7 @@ class SqlOpsGuardTest {
 
     @Test
     fun `query пропускает select с ведущим комментарием`() {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
 
         // Дойти до соединения не должно — падение здесь означало бы, что запрос отвергнут разбором.
         val thrown = catchThrowable {
@@ -66,7 +66,7 @@ class SqlOpsGuardTest {
 
     @Test
     fun `executeReturning гейтится dry-run'ом и не ходит в базу`() {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
 
         val ids = with(ctx) {
             jdbc(db).executeReturning("insert into orders(id) values (1) returning id") { it.getLong(1) }
@@ -78,7 +78,7 @@ class SqlOpsGuardTest {
 
     @Test
     fun `tx-bound ops не даёт работать с транзакцией из чужого потока`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val txOps = SqlOps(ctx, db, txConn = explodingConnection, inTx = true)
         val pool = Executors.newSingleThreadExecutor()
 
@@ -98,7 +98,7 @@ class SqlOpsGuardTest {
 
     @Test
     fun `вложенный transactional запрещён и под dry-run тоже`() {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
 
         val thrown = catchThrowable {
             with(ctx) {

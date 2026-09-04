@@ -1,14 +1,17 @@
 # Пример: Resend-архетип
 
+> Пошаговое описание узлов — в [гайде](../USER_GUIDE.md).
+
 **Задача.** По тикету SAMPLE-001 нужно заново отправить в Kafka события по
 «провисшим» заказам из Postgres. Для каждого заказа — дёрнуть сервис обогащения
 (узнать актуальный статус клиента), собрать событие и опубликовать в топик
 `orders.resync`. Провальные элементы складываются в аудит-CSV, чтобы потом
 разобраться руками.
 
-Полноценный скрипт с использованием Migration DSL умещается в ~15 строк тела
-`migrate()`. Ниже — всё необходимое для того, чтобы это работало в проекте на
-Kora: код, конфиг и то, как запускать.
+Заказов много, они разбиты по системам-источникам (`origin`), и требование
+эксплуатации звучит так: **пока все события одного origin не подтверждены брокером,
+следующий не начинаем**. Ровно под это в DSL есть `scoped` — стадия с барьером
+подтверждений на каждого родителя.
 
 > Живой аналог всего описанного ниже (без Kafka и HTTP, но с работающим графом и
 > тестами) лежит в модуле `example/` этого репозитория.
@@ -26,7 +29,7 @@ my-service/
 │   ├── EnrichmentService.kt            # Kora @HttpClient
 │   ├── OrdersPublisher.kt              # Kora @KafkaPublisher
 │   ├── SampleConfig.kt                 # @ConfigSource конфиг скрипта
-│   └── SampleMigration.kt              # сам скрипт: Migration + @Component
+│   └── SampleMigration.kt              # сам скрипт: MigrationDefinition + @Component
 └── src/main/resources/application.conf
 ```
 
@@ -93,8 +96,8 @@ migration {
   defaults {
     onUnhandled    = FAIL_FAST
     progressEvery  = 500
-    # Дефолт аргумента forEach(parallel = ...), а НЕ размер пула: пул runner'а cached
-    # и выдаёт столько воркеров, сколько запросил конкретный forEach.
+    # Дефолт аргумента source/scoped(parallel = ...), а НЕ размер пула: пул runner'а
+    # cached и выдаёт столько воркеров, сколько запросила конкретная стадия.
     parallel       = 1
     errorThreshold = 0
   }
@@ -133,10 +136,13 @@ httpClient.enrichment {
 
 # Наш пользовательский конфиг скрипта — отдельная секция
 sample {
-  batchSize = 200
-  parallel  = 4
-  # Имя origin-а, которое включаем в фильтр. Отсутствует = все.
-  originFilter = ${?SAMPLE_ORIGIN_FILTER}
+  pageSize = 500
+  parallel = 4
+  # Ждать подтверждений по одному origin не дольше этого.
+  completionTimeout = 10m
+  # Ограничить прогон конкретными origin'ами. Пусто = все.
+  origins = []
+  origins = ${?SAMPLE_ORIGINS}
 }
 ```
 
@@ -170,12 +176,17 @@ package com.example.migrations
 import org.apache.kafka.clients.producer.RecordMetadata
 import ru.tinkoff.kora.json.common.annotation.Json
 import ru.tinkoff.kora.kafka.common.annotation.KafkaPublisher
+import java.util.concurrent.CompletionStage
 
 @KafkaPublisher("kafka.orders.publisher")
 interface OrdersPublisher {
 
+    /**
+     * Возвращаем CompletionStage, а не RecordMetadata: это то, что барьер стадии умеет
+     * ждать. Блокирующий вариант тоже допустим — см. «write или publish» ниже.
+     */
     @KafkaPublisher.Topic("kafka.orders.resyncTopic")
-    fun publishResync(key: String, @Json value: OrderResyncEvent): RecordMetadata
+    fun publishResync(key: String, @Json value: OrderResyncEvent): CompletionStage<RecordMetadata>
 }
 ```
 
@@ -240,12 +251,14 @@ default-метода, необязательное значение — nullable
 package com.example.migrations
 
 import ru.tinkoff.kora.config.common.annotation.ConfigSource
+import java.time.Duration
 
 @ConfigSource("sample")
 interface SampleConfig {
-    fun batchSize(): Int = 200
+    fun pageSize(): Int = 500
     fun parallel(): Int = 4
-    fun originFilter(): String?      // отсутствует в конфиге → null
+    fun completionTimeout(): Duration = Duration.ofMinutes(10)
+    fun origins(): List<String> = emptyList()   // пусто → взять все из БД
 }
 ```
 
@@ -255,15 +268,14 @@ interface SampleConfig {
 // com/example/migrations/SampleMigration.kt
 package com.example.migrations
 
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.OnError
+import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.MigrationDefinition
 import io.github.dsudomoin.migration.error.includeItem
-import io.github.dsudomoin.migration.forEach
 import io.github.dsudomoin.migration.kora.ops.jdbc
-import io.github.dsudomoin.migration.mutation
+import io.github.dsudomoin.migration.migration
 import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
+import java.sql.ResultSet
 
 @Component
 class SampleMigration(
@@ -271,70 +283,163 @@ class SampleMigration(
     private val enrichment: EnrichmentService,
     private val publisher: OrdersPublisher,
     private val config: SampleConfig,
-) : Migration(name = "SAMPLE-001", author = "team") {
+) : MigrationDefinition {
 
-    override fun MigrationContext.migrate() {
-        errors.includeItem<Order> { "order=${it.id}, customer=${it.customerId}" }
+    override val name = "SAMPLE-001"
 
-        val stuck = jdbc(orders).query(
-            """
-            select id, customer_id, amount, origin
-            from orders
-            where status = 'STUCK'
-              and (:origin::text is null or origin = :origin)
-            """.trimIndent(),
-            "origin" to config.originFilter(),
-        ) { rs ->
-            Order(
-                id = rs.getLong("id"),
-                customerId = rs.getString("customer_id"),
-                amount = rs.getLong("amount"),
-                origin = rs.getString("origin"),
-            )
-        }
+    override fun plan() = migration(name = name, author = "team") {
+        val resent = output("resent.csv", "origin", "order_id", "customer_status")
 
-        forEach(stuck,
-                chunk = config.batchSize(),
-                parallel = config.parallel(),
-                onError = OnError.Skip) { batch ->
-            batch.forEach { order ->
-                val status = enrichment.customerStatus(order.customerId).status   // ретраит Kora @Retry внутри
-                mutation("orders.resync", args = mapOf("orderId" to order.id)) {
-                    publisher.publishResync(
-                        order.id.toString(),
-                        OrderResyncEvent(order.id, order.customerId, status, order.amount, order.origin),
-                    )
+        // Ленивое значение прогона: читается один раз при первом resolve и кэшируется.
+        val origins = input("origins") {
+            config.origins().ifEmpty {
+                jdbc(orders).query("select distinct origin from orders where status = 'STUCK' order by origin") {
+                    it.getString("origin")
                 }
             }
         }
+
+        validate {
+            require(config.pageSize() > 0) { "sample.pageSize должен быть > 0" }
+            require(config.parallel() > 0) { "sample.parallel должен быть > 0" }
+        }
+
+        scoped(
+            parents = { resolve(origins).asSequence() },
+            completionTimeout = config.completionTimeout(),
+            parallel = config.parallel(),
+            onItemError = ItemError.Skip,
+            items = { origin ->
+                // items вызывается на каждого родителя, значит и регистрация повторится —
+                // она идемпотентна и стоит копейки, а другого места «до первого обработчика»
+                // внутри стадии нет.
+                errors.includeItem<Order> { "order=${it.id}, customer=${it.customerId}, origin=${it.origin}" }
+
+                pages(
+                    name = "orders-$origin",
+                    first = {
+                        jdbc(orders).query(
+                            """
+                            select id, customer_id, amount, origin from orders
+                            where status = 'STUCK' and origin = :origin
+                            order by id limit :n
+                            """.trimIndent(),
+                            "origin" to origin, "n" to config.pageSize(),
+                        ) { order(it) }
+                    },
+                    next = { afterId ->
+                        jdbc(orders).query(
+                            """
+                            select id, customer_id, amount, origin from orders
+                            where status = 'STUCK' and origin = :origin and id > :after
+                            order by id limit :n
+                            """.trimIndent(),
+                            "origin" to origin, "after" to afterId, "n" to config.pageSize(),
+                        ) { order(it) }
+                    },
+                    nextCursor = { page -> page.last().id },
+                    continueWhen = { page -> page.size >= config.pageSize() },
+                )
+            },
+        ) { order ->
+            val status = enrichment.customerStatus(order.customerId).status   // ретраит Kora @Retry внутри
+
+            publish("orders.resync", args = mapOf("orderId" to order.id, "origin" to order.origin)) {
+                publisher.publishResync(
+                    order.id.toString(),
+                    OrderResyncEvent(order.id, order.customerId, status, order.amount, order.origin),
+                )
+            }
+
+            resent.row(order.origin, order.id, status)
+        }
     }
+
+    private fun order(rs: ResultSet) = Order(
+        id = rs.getLong("id"),
+        customerId = rs.getString("customer_id"),
+        amount = rs.getLong("amount"),
+        origin = rs.getString("origin"),
+    )
 
     private data class Order(val id: Long, val customerId: String, val amount: Long, val origin: String)
 }
 ```
 
-**Важно про `chunk` + `OnError.Skip`.** Единицей учёта и единицей отката здесь является
-**батч**, а не заказ: исключение на 137-м заказе из 200 обрывает весь батч, первые 136
-уже отправлены, остальные 63 не будут отправлены никогда, а в `errors.csv` уедет одна
-строка — весь `List<Order>`. Если такая гранулярность не устраивает, есть два пути:
+### Что здесь делает `scoped` — и почему не `source`
 
-- убрать `chunk` (`forEach(stuck, parallel = ...)`) — тогда единица = один заказ,
-  и `Skip` теряет ровно один заказ;
-- ловить ошибку внутри батча самому:
+`source` — одна граница на всю стадию: барьер подтверждений стоит в самом конце, когда
+источник исчерпан. Для resend'а это значит «миллион сообщений в полёте и один момент истины
+в конце». `scoped` режет ту же работу на родителей и ставит барьер на каждого:
+
+1. открывается родитель `web` → читаются его страницы → воркеры публикуют;
+2. источник родителя исчерпан → **барьер**: ждём подтверждения по всем `publish` этого
+   origin'а (не дольше `completionTimeout`);
+3. закрываются ресурсы, зарегистрированные через `scopedResource` внутри этого родителя;
+4. только теперь открывается `mobile`.
+
+Что это даёт на практике:
+
+- **Осмысленный рестарт.** Прогон упал на третьем origin — первые два доставлены полностью,
+  перезапускаешь с `SAMPLE_ORIGINS=[третий,четвёртый]`. С одним общим барьером в конце
+  такого знания нет вовсе.
+- **Ограниченный in-flight.** Незавершённых отправок не больше, чем успевает накопить один
+  origin, а не весь прогон.
+- **`completionTimeout` считается по родителю** — и ограничивает **только ожидание
+  подтверждений** после исчерпания источника, а не время чтения и отправки. Десять минут
+  здесь — это «сколько ждём ack'ов у брокера», а не «сколько работает origin».
+
+Порядок в `scoped` строго последовательный: родители не идут параллельно. Параллелизм
+живёт **внутри** родителя — `parallel = 4` это четыре одновременно обрабатываемых заказа
+текущего origin'а.
+
+### `publish` или `write`
+
+| | `write(name, args) { ...: WriteOutcome }` | `publish(name, args) { ...: CompletionStage<*> }` |
+|---|---|---|
+| Когда исход известен | сразу, синхронно | позже, на барьере scope'а |
+| Возвращает | `WriteResult` | ничего — под dry-run возвращать было бы нечего |
+| Под dry-run | тело не вызывается, `DryRunSkipped` | тело не вызывается, фальшивый future не создаётся |
+| Отказ обрабатывается | как ошибка item'а, через `ItemError` | **валит стадию на барьере**, мимо `ItemError` |
+| Счётчики отчёта | `appliedWrites` / `rejectedWrites` / `dryRunSkipped` | `acknowledgedPublishes` / `failedEffects` / `abandonedPublishes` / `dryRunSkipped` |
+
+Если твой `@KafkaPublisher`-метод объявлен блокирующим (возвращает `RecordMetadata`), то он
+и есть синхронная запись — оборачивай в `write`:
 
 ```kotlin
-batch.forEach { order ->
-    try {
-        val status = enrichment.customerStatus(order.customerId).status
-        mutation("orders.resync", args = mapOf("orderId" to order.id)) { /* ... */ }
-    } catch (e: Exception) {
-        auditError(e, order)     // строка в errors.csv по конкретному заказу
+write("orders.resync", args = mapOf("orderId" to order.id)) {
+    publisher.publishResync(order.id.toString(), event)   // RecordMetadata, блокирующий
+    WriteOutcome.Applied
+}
+```
+
+Барьера при этом не будет — он и не нужен: метод уже вернулся с ack'ом.
+
+**Почему отказ `publish` не проходит через `ItemError`.** К моменту, когда брокер ответил
+ошибкой, item давно посчитан успешным и обработчик по нему закончился — `Decision.Skip` для
+него физически неприменим. Поэтому любой отказ доставки валит стадию на барьере
+(`ScopeEffectsFailed`), а каждый отказ поштучно уезжает в `errors.csv` вместе с тем item'ом,
+на котором был отправлен. Не дождавшиеся за `completionTimeout` учитываются как
+`abandonedPublishes` и поднимают exit-код до 1: отправленное не отзывается, и молча
+исчезать оно не имеет права.
+
+### Сырой продюсер вместо типизированного publisher'а
+
+Если типизированный `@KafkaPublisher` не подходит (шлёшь в разные топики, нужен явный
+контроль), возьми `topic(producer, name)` — его `sendAsync` тоже отдаёт future, который
+принимает `publish`:
+
+```kotlin
+) { order ->
+    // Хендл мемоизируется на пару (producer, name) через shared — звать прямо в теле не накладно.
+    val resync = topic(producer, "orders.resync")
+    publish("orders.resync", args = mapOf("orderId" to order.id)) {
+        resync.sendAsync(order.id.toString(), order.toBytes())
     }
 }
 ```
 
-`chunk` берут ради round-trip'ов (`where id in :ids`, bulk-insert). Если тело батча —
-это цикл независимых вызовов, как здесь, честнее item-by-item.
+Сырой `Producer` в граф надо принести самому — см. §8.
 
 ## 8. `@KoraApp` — собираем граф
 
@@ -371,6 +476,9 @@ fun main() {
 
 `MigrationModule` — единственное, что нужно от нашей либы: секцию `migration { ... }`
 он читает сам, а runner помечен `@Root` и создаётся графом без явных зависимостей.
+Твой скрипт runner находит через `All<MigrationDefinition>` — достаточно `@Component`
+на классе. Имя (`name`) — константа: по нему runner выбирает миграцию и проверяет
+дубли, **не строя планов**; `plan()` вызывается ровно один раз и только у выбранной.
 
 **Никакого `KafkaProducerModule` в Kora не существует** — если он остался в старых
 примерах, это опечатка, граф с ним не соберётся. Типизированному `@KafkaPublisher`
@@ -408,7 +516,7 @@ interface RawProducerModule {
 
 ## 9. Как запускать
 
-### Прогон в dry-run (не шлёт в Kafka, не меняет БД, но читает orders и дёргает enrichment):
+### Прогон в dry-run (не шлёт в Kafka, но читает orders и дёргает enrichment):
 
 ```bash
 MIGRATION_RUN=SAMPLE-001 \
@@ -421,9 +529,9 @@ ENRICHMENT_URL=https://enrichment.internal \
 
 В логе увидишь:
 ```
-INFO  [SAMPLE-001] [forEach] progress: 20/43 (46%)  elapsed=12s  rate=1/s
-INFO  [SAMPLE-001] [DRY-RUN] mutation:orders.resync (orderId=42)
-INFO  [SAMPLE-001] [DRY-RUN] mutation:orders.resync (orderId=43)
+INFO  i.g.d.migration.SAMPLE-001 - progress: 500  elapsed=12s  rate=41/s
+INFO  i.g.d.migration.SAMPLE-001 - [DRY-RUN] orders.resync (orderId=42, origin=web)
+INFO  i.g.d.migration.SAMPLE-001 - [DRY-RUN] orders.resync (orderId=43, origin=web)
 ...
 ═══════════════════════════════════════════════════════════
 Migration: SAMPLE-001  (author: team)
@@ -432,27 +540,31 @@ Finished:  2026-04-24 14:18:04 +03:00
 Duration:  2m 32s
 Mode:      DRY-RUN
 ───────────────────────────────────────────────────────────
-Processed:                 43
-  ✓ Successful:            43
+Processed:                 8 421
+  ✓ Successful:            8 421
   ⊘ Skipped (errors):      0
   ✗ Failed:                0
-  ⌀ Dry-run skipped writes:    (mutation:orders.resync: 8421)
+  ⌀ Source pages read:       18  (rows: 8 421)
+  ⌀ Dry-run skipped writes:    (orders.resync: 8421)
 ───────────────────────────────────────────────────────────
 ═══════════════════════════════════════════════════════════
 ```
 
 Что тут читать:
 
-- `Processed: 43` — это **батчи** (8421 заказ по 200 в батче), не заказы.
+- `Processed: 8 421` — это **заказы**: item стадии здесь один заказ, а не батч.
+- `Source pages read` — сколько страниц и сырых строк реально вычитал `pages(...)`,
+  **до** любых пользовательских `filter`. Единственный способ увидеть разницу между
+  «прочитано» и «дошло до обработчика».
 - `Dry-run skipped writes` показывает, сколько сообщений ушло бы в Kafka. Ни одного
-  реального сайд-эффекта.
+  реального сайд-эффекта: под репетицией лямбда `publish` не вызывается вообще.
 - Метки времени печатаются со смещением зоны (`+03:00`) — `errors.csv` пишет UTC,
   и по смещению одно с другим сопоставляется без гадания.
 - Строк `Error details:` / `Error traces:` нет, потому что `errors.csv` создаётся
   лениво — только на первой ошибке.
 - Если бы breakdown оказался **пустым** при непустом `Processed`, runner напечатал бы
   WARN и добавил бы предупреждение в отчёт: под dry-run это единственный наблюдаемый
-  признак того, что где-то забыли `mutation { }` и запись ушла в бой по-настоящему.
+  признак того, что где-то забыли `write`/`publish` и запись ушла в бой по-настоящему.
 
 ### Боевой прогон:
 
@@ -464,20 +576,30 @@ ENRICHMENT_URL=https://enrichment.internal \
 ./gradlew run
 ```
 
-Отличие в отчёте:
+Отличие в отчёте — вместо dry-run-строки появляется учёт доставки:
 ```
 Mode:      REAL
 ───────────────────────────────────────────────────────────
-Processed:                 43           # батчей (по 200 = 8421 заказ)
-  ✓ Successful:            43
+Processed:                 8 421
+  ✓ Successful:            8 421
   ⊘ Skipped (errors):      0
   ✗ Failed:                0
+  ✓ Acknowledged publishes:  8 421
+  ⌀ Source pages read:       18  (rows: 8 421)
 ───────────────────────────────────────────────────────────
 ```
 
-Exit-коды: `0` — всё гладко; `1` — `Fail`, превышен `errorThreshold` либо были отказы
-async-доставки в Kafka; `2` — мисконфиг (неизвестное имя, дубликат имён, битые значения
-`migration.defaults.*`, невозможно создать `outputFolder`).
+`Acknowledged publishes` — сколько отправок брокер реально подтвердил, просуммировано
+по всем барьерам. Если бы что-то пошло не так, рядом появились бы строки
+`✗ Failed effects` (брокер отказал) и `⚠ Unconfirmed effects (abandoned: N, late: M)`
+(не дождались за таймаут / зарегистрировано после барьера).
+
+Exit-коды: `0` — всё гладко; `1` — `FAIL_FAST`, превышен `errorThreshold` либо остались
+неподтверждённые эффекты; `2` — мисконфиг (неизвестное имя, дубликат имён, битые значения
+`migration.defaults.*`, невозможно создать `outputFolder`, план не построился).
+
+Неподтверждённые эффекты поднимают код возврата **независимо от `ScriptPolicy`**:
+`LOG_AND_COMPLETE` не имеет права превратить потерянные сообщения в ноль.
 
 ---
 
@@ -487,55 +609,68 @@ async-доставки в Kafka; `2` — мисконфиг (неизвестн�
 |---|---|
 | Kora-инъекция источников | 4 зависимости через constructor |
 | Типизированный конфиг | `SampleConfig` как `@ConfigSource`-интерфейс |
-| Автоматическая регистрация | `@Component` — runner находит через `All<Migration>` |
+| Автоматическая регистрация | `@Component` — runner находит через `All<MigrationDefinition>` |
+| `input(name) { }` | Список origin'ов читается один раз на прогон и кэшируется |
+| `validate { }` | Проверка конфига до первой стадии и до любого эффекта |
+| `scoped(parents = ..., completionTimeout = ...)` | Барьер подтверждений на каждый origin: следующий не начнётся, пока предыдущий не доставлен |
+| `pages(...)` | Курсорный источник внутри родителя; `rawPages`/`rawRows` в отчёте |
 | Чтение из Postgres | `jdbc(orders).query(..., mapper)` — только read-запросы |
 | HTTP-вызов (read) | `enrichment.customerStatus(...)` напрямую, без обёрток |
-| Публикация в Kafka с dry-run gate | `@KafkaPublisher.Topic` + `mutation("orders.resync", args = ...) { publisher.publishResync(...) }` |
-| Batch + параллелизм | `forEach(chunk, parallel, onError = OnError.Skip)` — `parallel` даёт реальные воркеры |
+| Публикация в Kafka под барьером | `publish("orders.resync", args) { publisher.publishResync(...) }` |
+| Параллелизм внутри родителя | `parallel = 4` — реальные воркеры, пул runner'а cached |
 | Retry для transient HTTP | Kora `@Retry` на `EnrichmentService.customerStatus` — backoff внутри клиента, не на уровне DSL |
-| Авто error-reporting | `errors.includeItem<Order> { ... }` — одна строка |
-| Авто progress-лог | ничего не пишем — `Progress.Default` каждые `progressEvery` обработанных элементов (на коротких циклах шаг сам уменьшается до ~1/10 от total, чтобы прогресс был виден) |
+| Авто error-reporting | `errors.includeItem<Order> { ... }` — одна строка в `items` |
+| Авто progress-лог | ничего не пишем — `Progress.Default` каждые `progressEvery` обработанных |
 | Итоговый отчёт | печатает сам runner |
 | Dry-run | `MIGRATION_DRY_RUN=true` + строка `dryRun = ${?MIGRATION_DRY_RUN}` в конфиге — никакого `if` в коде |
 
 ## 11. Что НЕ нужно писать
 
-- Никаких `try/catch` вокруг всего — `OnError.Skip` + Kora `@Retry` на клиенте делают всё.
-  Провалившиеся батчи попадают в `logs/SAMPLE-001/errors.csv` автоматически. Локальный
-  `try/catch` нужен только там, где хочется пер-элементная гранулярность внутри батча (§7).
-- Никаких `Lists.partition` — `chunk = 200` в `forEach`.
-- Никаких `ExecutorService` — `parallel = 4` в `forEach`; пул runner'а cached и выдаст
+- Никаких `try/catch` вокруг всего — `ItemError.Skip` + Kora `@Retry` на клиенте делают всё.
+  Провалившиеся заказы попадают в `logs/SAMPLE-001/errors.csv` автоматически. Локальный
+  `try/catch` нужен только там, где хочется своё поведение внутри одного item'а.
+- Никаких `Lists.partition` — если батчи нужны, это `.chunked(n)` прямо в `items`.
+- Никаких `ExecutorService` — `parallel = 4` в `scoped`; пул runner'а cached и выдаст
   ровно столько воркеров, сколько попросили.
-- Никаких `if (dryRun)` — DSL сам решает, что делать с `mutation { publisher.publishResync(...) }`.
-- Никаких ручных `writer.close()` / try-with-resources — нет CSV-файлов в этом скрипте
-  (если бы были — `val out = openCsv(path, headers...)` сверху, а runner закрыл бы сам).
+- Никаких `if (dryRun)` — DSL сам решает, что делать с `publish { }`.
+- Никаких `CountDownLatch` / `producer.flush()` / сбора `List<Future>` — барьер scope'а
+  и есть это ожидание, а счётчики подтверждений ведёт движок.
+- Никаких ручных `writer.close()` — `output(...)` объявлен в билдере, закрывает движок.
 - Никакого ручного подсчёта processed/skipped — `MigrationReport` копит автоматически.
 
 ## 12. Вариации
 
-**Correction-архетип** (чтение CSV + update в БД): `readCsv(path, onRowError = OnError.Skip) { ... }`
-+ `forEach { jdbc(orders).execute("update ...") }`, Kafka не нужна. `onRowError` обязателен,
-если битая строка входного файла не должна валить прогон: по умолчанию там `OnError.Fail`.
-В `errors.csv` такая строка уезжает как сырая `Map<String, String>` — если в колонках есть
-чувствительные данные, добавь `errors.includeItem<Map<String, String>> { ... }`.
+**Одна стадия вместо scoped.** Если группировать не по чему и барьер нужен один, это
+обычный `source(...)` с тем же `items`/`handle`. Барьер встанет в конце стадии; всё
+отправленное будет ждаться там же.
+
+**Батчи вместо поштучной отправки.** `.chunked(n)` на результате `pages(...)` — тогда item
+стадии становится `List<Order>`, а `publish` зовётся в цикле внутри обработчика. Берут ради
+round-trip'ов (обогащение пачкой), а не ради Kafka: единица `Skip` при этом тоже становится
+батчем, и в `errors.csv` уедет весь список.
+
+**Correction-архетип** (чтение CSV + update в БД): `readCsv(path, onRowError = ItemError.Skip) { ... }`
++ `jdbc(orders).execute("update ...")`, Kafka не нужна. См.
+[correction-archetype.md](correction-archetype.md).
 
 **Comparison-архетип** (два кластера, пишем расхождения): `cassandra(primary).query(...)` +
-`cassandra(replica).query(...)` + `openCsv("failed.csv", "contract", "reason")` сверху для аудита.
-См. `kora/src/test/kotlin/io/github/dsudomoin/migration/kora/pilot/ComparisonPilotTest.kt`.
+`cassandra(replica).query(...)` + два `output(...)`. См.
+[comparison-archetype.md](comparison-archetype.md) и
+[pilot-тест](../../kora/src/test/kotlin/io/github/dsudomoin/migration/kora/pilot/ComparisonPilotTest.kt).
 
-**REST-operation**: `forEach(items) { http(client).post("/sync", body) }` или типизированный
-Kora-клиент внутри `mutation("sync.order", args = mapOf("id" to id)) { ... }` для write-вызовов
-(label — константа, контекст item'а — в args; см. USER_GUIDE.md §13). `http(...).post/put/...`
-бросает `HttpStatusException` на любой ответ вне 2xx — «успешный» item при мёртвом бэкенде
-получить нельзя.
+**REST-operation**: `http(client).post("/sync", body)` (гейт внутри op) или типизированный
+Kora-клиент внутри `write("sync.order", args = mapOf("id" to id)) { ...; WriteOutcome.Applied }`
+для write-вызовов. Метка — константа, контекст item'а — в `args`. См.
+[http-backfill-archetype.md](http-backfill-archetype.md).
 
 **Запись с возвратом строк**: `jdbc(db).executeReturning("insert ... returning id") { it.getLong("id") }`.
 Через `query(...)` пишущий запрос не пройдёт — он проверяет первое ключевое слово и бросает
 `IllegalArgumentException`, потому что `query` не проходит dry-run gate и выполнился бы в бою
 во время репетиции.
 
-**Command sending**: в теле `migrate()` генерируешь данные (например, из CSV) и сразу
-`kafka(producer).publish(...)` в `forEach`. Полезно когда из одного скрипта пишешь в
-**разные** топики и не хочешь городить `@KafkaPublisher.Topic` на каждый. Хендл `kafka(producer)`
-мемоизируется на продюсер (`MigrationContext.shared`), так что вызывать его прямо в теле цикла
-не накладно.
+**Command sending**: источником стадии может быть что угодно, включая CSV с командами —
+читаешь `readCsv`, публикуешь `kafka(producer).publish(...)` (синхронно, гейт внутри op) или
+`publish { topic.sendAsync(...) }` (под барьером). Полезно когда из одного скрипта пишешь в
+**разные** топики и не хочешь заводить `@KafkaPublisher.Topic` на каждый. Хендлы
+`kafka(producer)` и `topic(producer, name)` мемоизируются через `shared`, так что вызывать
+их прямо в теле обработчика не накладно.

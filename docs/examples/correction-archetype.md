@@ -1,10 +1,12 @@
 # Пример: Correction-архетип
 
+> Пошаговое описание узлов — в [гайде](../USER_GUIDE.md).
+
 **Задача.** По тикету SAMPLE-001 compliance прислал CSV со списком ID клиентов,
 которым нужно проставить `status = 'UNDER_REVIEW'` и оставить аудит-запись.
 Никаких внешних сервисов, никакой Kafka — только Postgres.
 
-Это самый «дешёвый» архетип. Скрипт умещается в ~15 строк.
+Это самый «дешёвый» архетип. План умещается в один `output` и одну стадию.
 
 ## Setup
 Сборка (KSP), `db.*`, `@KoraApp` — см.
@@ -26,7 +28,7 @@ migration {
 JDBC-операции этого архетипа покрыты интеграционным тестом на Testcontainers
 (реальный Postgres 16):
 [`SqlOpsIntegrationTest`](../../kora/src/test/kotlin/io/github/dsudomoin/migration/kora/ops/SqlOpsIntegrationTest.kt)
-— `./gradlew :kora:test`. Полный end-to-end прогон миграции-архетипа против двух
+— `./gradlew :kora:test`. Полный end-to-end прогон плана-архетипа против двух
 реальных БД — в
 [`ComparisonPilotTest`](../../kora/src/test/kotlin/io/github/dsudomoin/migration/kora/pilot/ComparisonPilotTest.kt).
 
@@ -44,11 +46,11 @@ sample {
 import ru.tinkoff.kora.config.common.annotation.ConfigSource
 
 @ConfigSource("sample")
-data class SampleConfig(
-    var inputFile: String,
-    var batchSize: Int,
-    var parallel: Int,
-)
+interface SampleConfig {
+    fun inputFile(): String
+    fun batchSize(): Int = 500
+    fun parallel(): Int = 4
+}
 ```
 
 `parallel = 4` здесь означает 4 одновременно работающих батча, каждый со своей
@@ -60,15 +62,13 @@ data class SampleConfig(
 ```kotlin
 package com.example.migrations
 
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.OnError
-import io.github.dsudomoin.migration.csv.openCsv
+import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.MigrationDefinition
 import io.github.dsudomoin.migration.csv.readCsv
 import io.github.dsudomoin.migration.error.includeItem
-import io.github.dsudomoin.migration.forEach
 import io.github.dsudomoin.migration.kora.ops.jdbc
 import io.github.dsudomoin.migration.kora.ops.transactional
+import io.github.dsudomoin.migration.migration
 import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 
@@ -76,19 +76,25 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 class SampleMigration(
     private val db: JdbcConnectionFactory,
     private val config: SampleConfig,
-) : Migration(name = "SAMPLE-001", author = "team") {
+) : MigrationDefinition {
 
-    override fun MigrationContext.migrate() {
-        errors.includeItem<String> { "customer_id=$it" }
+    override val name = "SAMPLE-001"
 
-        val ids = readCsv(config.inputFile) { it["customer_id"]!! }.toList()
-        val processed = openCsv("processed.csv", "id")
+    override fun plan() = migration(name = name, author = "team") {
+        val processed = output("processed.csv", "id")
 
-        forEach(
-            ids,
-            chunk = config.batchSize,
-            parallel = config.parallel,
-            onError = OnError.Skip,
+        source(
+            parallel = config.parallel(),
+            onItemError = ItemError.Skip,
+            items = {
+                // Сериализатор регистрируется здесь: items выполняется до первого обработчика.
+                // Тип — List<String>, потому что item стадии после .chunked(...) это батч, а не id.
+                errors.includeItem<List<String>> { "batch of ${it.size}, first=${it.firstOrNull()}" }
+
+                // Батчинг — обычный Sequence.chunked: отдельного параметра chunk у стадии нет.
+                readCsv(config.inputFile()) { it.getValue("customer_id") }
+                    .chunked(config.batchSize())
+            },
         ) { batch ->
             transactional(jdbc(db)) {
                 batch.forEach { id ->
@@ -105,6 +111,16 @@ class SampleMigration(
 `includeItem` — extension на `ErrorReporter`, живёт в
 `io.github.dsudomoin.migration.error`; без этого импорта скрипт не соберётся.
 
+`readCsv` по умолчанию идёт с `onRowError = ItemError.Fail`: битая строка входного
+файла валит прогон до первого `update`'а. Это разумный дефолт для compliance-списка
+— лучше починить файл, чем молча обработать половину. Если входной CSV заведомо
+грязный, политика задаётся явно:
+`readCsv(config.inputFile(), onRowError = ItemError.Skip) { it.getValue("customer_id") }` —
+тогда строка уедет в `errors.csv` и посчитается в `report.sourceSkipped` (строка
+`Source rows dropped` в отчёте), а до обработчика не доедет. Это отдельный счётчик от
+`report.skipped`: `errorThreshold` его не считает — порог сторожит ошибки обработки,
+а не грязь на входе.
+
 Если из `update`/`insert` нужно забрать строки (`... returning id`), это
 `executeReturning(sql, ...) { rs -> ... }`, а не `query`: `query`/`stream` принимают
 только читающие запросы и на пишущем бросают `IllegalArgumentException`. Причина —
@@ -112,13 +128,58 @@ class SampleMigration(
 по-настоящему во время репетиции. `executeReturning` проходит гейт как обычная
 запись и под dry-run возвращает пустой список.
 
-`readCsv` по умолчанию идёт с `onRowError = OnError.Fail`: битая строка входного
-файла валит прогон до первого `update`'а. Это разумный дефолт для compliance-списка
-— лучше починить файл, чем молча обработать половину. Если входной CSV заведомо
-грязный, политика задаётся явно:
-`readCsv(config.inputFile, onRowError = OnError.Skip) { it["customer_id"]!! }` —
-тогда строка уедет в `errors.csv`, посчитается в `report.skipped` и в
-`errorThreshold`, а до `forEach` не доедет.
+## Нужен ли здесь `write { }`
+
+Не обязателен. `jdbc.execute` / `batch` / `executeReturning` **сами** проходят через
+dry-run-гейт, поэтому под репетицией ничего не запишется и без обёртки.
+
+`write { }` / `writeRows { }` обязательны там, где вызов идёт мимо ops библиотеки:
+типизированный Kora `@HttpClient`, `@KafkaPublisher`, чужой репозиторий, SDK — их DSL
+перехватить не может.
+
+Поверх ops это осознанный обмен, а не улучшение по умолчанию:
+
+- **что получаешь** — бизнес-исход в отчёте: `appliedWrites["customers.under-review"]`
+  и отдельно `rejectedWrites` для «ни одна строка не подошла», вместо безымянного
+  `jdbc.execute`;
+- **что теряешь** — под dry-run тело `write` не выполняется вовсе, поэтому вложенный
+  `jdbc.execute` до своего гейта не доходит: в breakdown окажется одна твоя метка, а не
+  честное число SQL-запросов.
+
+Пример, где обмен оправдан — там, где ноль изменённых строк это штатный исход, а не сбой:
+
+```kotlin
+source(
+    parallel = 8,
+    onItemError = ItemError.Skip,
+    items = { readCsv(config.inputFile()) { it.getValue("customer_id") } },
+) { id ->
+    // 0 затронутых строк — это не сбой, а Rejected("no rows matched"):
+    // клиента уже нет или он уже в нужном статусе. В отчёте это отдельный счётчик.
+    writeRows("customers.under-review", args = mapOf("id" to id)) {
+        jdbc(db).execute("update customers set status = 'UNDER_REVIEW' where id = :id and status <> 'UNDER_REVIEW'", "id" to id)
+    }
+    processed.row(id)
+}
+```
+
+`writeRows` уместен ровно там, где операция реально возвращает число изменённых строк
+(`UPDATE ... WHERE`). Для Cassandra-INSERT или delete+insert числа строк нет — там
+`write("label") { ...; WriteOutcome.Applied }`.
+
+## Гранулярность: батч — это один item
+
+При `.chunked(500)` единицей учёта, единицей `Skip` и единицей потери является **батч**:
+
+- исключение на 137-м клиенте из 500 обрывает весь батч; транзакция откатится целиком
+  (в этом и смысл `transactional`), а оставшиеся 363 не обработаются никогда;
+- `report.skipped++` — это +1, а не +364, и `errorThreshold` считает батчи;
+- в `errors.csv` уедет одна строка, и item'ом там будет `List<String>` из 500 id —
+  поэтому сериализатор регистрируется на `List<String>`, а не на `String`.
+
+Батчинг берут ради round-trip'ов (одна транзакция на 500 записей вместо 500 транзакций).
+Если тело — цикл независимых вызовов, честнее item-by-item: убери `.chunked(...)`, и
+`Skip` будет терять ровно одного клиента.
 
 ## Запуск
 
@@ -136,7 +197,7 @@ MIGRATION_RUN=SAMPLE-001 \
 ```
 logs/SAMPLE-001/
 ├── migration.log
-├── errors.csv      # ID, попавшие в Skip-ветку
+├── errors.csv      # батчи, попавшие в Skip-ветку
 ├── errors.log
 └── processed.csv   # ID, которые успешно обновились
 ```
@@ -145,26 +206,32 @@ logs/SAMPLE-001/
 целиком — тело выполняется, пропускаются отдельные записи внутри него. То есть
 соединение не открывается, оба `execute` не доходят до БД (в breakdown отчёта —
 `jdbc.transactional` по числу батчей и `jdbc.execute` по числу запросов), а
-`processed.row(id)` отрабатывает как обычно — `processed.csv`
-после репетиции будет заполнен. Это тот же принцип, что и у `openCsv`: CSV-выход
-остаётся диагностическим артефактом прогона.
+`processed.row(id)` отрабатывает как обычно — `processed.csv` после репетиции будет
+заполнен. Это тот же принцип, что и у `output`: CSV-выход остаётся диагностическим
+артефактом прогона.
 
 ## Что архетип демонстрирует
 
 | Фича | Где |
 |---|---|
 | Read CSV → Postgres update | Каноничный correction-сценарий |
+| `output(...)` в билдере | Файл открывается один раз на прогон, закрывает движок |
+| `.chunked(N)` в `items` | Батчинг — обычный `Sequence.chunked`, отдельного параметра у стадии нет |
 | `transactional { ... }` | update + insert в одной транзакции (rollback если что-то упало) |
-| `OnError.Skip` | Если update + audit упали — батч пишется в `errors.csv` авто-репортером, миграция продолжается. Retry для transient deadlock'ов Postgres — на уровне Kora `@Retry` на repository-методе, не на уровне DSL |
-| `errors.includeItem<String> { ... }` | Per-type сериализатор: item — `customer_id`, в CSV пишется красиво |
-| Один `openCsv` | Только список обработанных. Прочее (`errors.csv`, `migration.log`) появится автоматически от runner'а |
-| Параллелизм по батчам | `parallel = 4` батча по `chunk = 500` строк бегут одновременно — но **внутри** одного батча update'ы идут sequential (один tx, один Connection). В каждый момент времени активно 4 БД-соединения, не 2000. Воркеры настоящие: пул runner'а cached и выдаёт столько потоков, сколько запросил `forEach`; `migration.defaults.parallel` — лишь дефолт для вызовов без явного аргумента |
-| `transactional` **внутри** `forEach` | Единственный корректный порядок. Наоборот — `forEach(parallel > 1)` внутри `transactional` — tx-bound `SqlOps` бросит `IllegalStateException`: `java.sql.Connection` не потокобезопасен, и DSL не даёт молча испортить данные |
+| `ItemError.Skip` | Если батч упал — он пишется в `errors.csv` авто-репортером, стадия продолжается. Retry для transient deadlock'ов Postgres — на уровне Kora `@Retry` на repository-методе, не на уровне DSL |
+| `errors.includeItem<List<String>> { ... }` | Per-type сериализатор: item — батч, в CSV пишется его размер и первый id |
+| `writeRows("label") { ... }` | Отделяет «применилось» от «ни одна строка не подошла» — там, где это отдельный бизнес-исход |
+| Параллелизм по батчам | `parallel = 4` батча по 500 строк бегут одновременно — но **внутри** одного батча update'ы идут sequential (один tx, один Connection). В каждый момент времени активно 4 БД-соединения, не 2000 |
+| `transactional` **внутри** обработчика | Единственный корректный порядок. Наоборот — параллельная стадия внутри `transactional` — tx-bound `SqlOps` бросит `IllegalStateException`: `java.sql.Connection` не потокобезопасен, и DSL не даёт молча испортить данные |
 
 ## Вариация: без транзакции (когда update идемпотентен)
 
 ```kotlin
-forEach(ids, parallel = 8, onError = OnError.Skip) { id ->
+source(
+    parallel = 8,
+    onItemError = ItemError.Skip,
+    items = { readCsv(config.inputFile()) { it.getValue("customer_id") } },
+) { id ->
     jdbc(db).execute("update customers set status = 'UNDER_REVIEW' where id = :id", "id" to id)
     processed.row(id)
 }
@@ -174,10 +241,35 @@ forEach(ids, parallel = 8, onError = OnError.Skip) { id ->
 восемь одновременных `db.inTx` — `db.maxPoolSize` поднимай до восьми, иначе половина
 потоков будет стоять в очереди за соединением.
 
-На 1M записей это быстрее, чем `transactional` по 500, потому что нет блокировок на
+На 1M записей это быстрее, чем транзакция по 500, потому что нет блокировок на
 батч. Уместно когда:
 - update идемпотентен (повторный вызов даёт тот же результат);
-- audit-запись не нужна или пишется отдельным шагом.
+- audit-запись не нужна или пишется отдельной стадией.
+
+Отдельной стадией — это буквально так:
+
+```kotlin
+override fun plan() = migration(name = name, author = "team") {
+    val processed = output("processed.csv", "id")
+    val ids = input("ids") { readCsv(config.inputFile()) { it.getValue("customer_id") }.toList() }
+
+    source(name = "update", parallel = 8, onItemError = ItemError.Skip, items = { resolve(ids).asSequence() }) { id ->
+        jdbc(db).execute("update customers set status = 'UNDER_REVIEW' where id = :id", "id" to id)
+        processed.row(id)
+    }
+
+    source(name = "audit", parallel = 4, items = { resolve(ids).asSequence().chunked(500) }) { batch ->
+        jdbc(db).batch("insert into customer_audit(customer_id, event, ts) values (?, 'incident_review', now())", batch) { ps, id ->
+            ps.setString(1, id)
+        }
+    }
+}
+```
+
+Стадии идут строго последовательно: аудит не начнётся, пока апдейт не закончился, и
+не начнётся вовсе, если апдейт провалился. Имена обязательны — как только стадий больше
+одной, план без имён не построится. `input("ids")` читает файл один раз на прогон:
+обе стадии спрашивают одно и то же значение, а не открывают файл дважды.
 
 ## Вариация: две Postgres-базы (main + audit)
 
@@ -236,13 +328,19 @@ class SampleMigration(
     private val main: JdbcConnectionFactory,                        // дефолтный db {}
     @Tag(AuditDb::class) private val audit: JdbcConnectionFactory,  // секция audit {}
     private val config: SampleConfig,
-) : Migration(name = "SAMPLE-001", author = "team") {
+) : MigrationDefinition {
 
-    override fun MigrationContext.migrate() {
-        errors.includeItem<String> { "customer_id=$it" }
-        val ids = readCsv(config.inputFile) { it["customer_id"]!! }.toList()
+    override val name = "SAMPLE-001"
 
-        forEach(ids, chunk = config.batchSize, parallel = config.parallel, onError = OnError.Skip) { batch ->
+    override fun plan() = migration(name = name, author = "team") {
+        source(
+            parallel = config.parallel(),
+            onItemError = ItemError.Skip,
+            items = {
+                errors.includeItem<List<String>> { "batch of ${it.size}, first=${it.firstOrNull()}" }
+                readCsv(config.inputFile()) { it.getValue("customer_id") }.chunked(config.batchSize())
+            },
+        ) { batch ->
             transactional(jdbc(main)) {
                 batch.forEach { id ->
                     execute("update customers set status = 'UNDER_REVIEW', updated_at = now() where id = :id", "id" to id)
@@ -264,7 +362,7 @@ class SampleMigration(
 Двухфазного коммита (XA) поверх двух баз DSL не даёт — и не пытается. Значит:
 
 - если `main` закоммитился, а `audit` упал → батч уедет в `errors.csv`
-  (`OnError.Skip`), но `customers` **уже обновлены**. Rollback'а через границу БД не
+  (`ItemError.Skip`), но `customers` **уже обновлены**. Rollback'а через границу БД не
   будет.
 
 Как с этим жить (по убыванию надёжности):

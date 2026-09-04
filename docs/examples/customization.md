@@ -1,15 +1,24 @@
 # Кастомизация Migration DSL
 
-DSL — это набор extension-функций на `MigrationContext` плюс несколько hook'ов
-(`register`, `shared`, `guardWrite`, `@Tag(MigrationExecutor)`, `MigrationExit`).
-Если из коробки чего-то не хватает — добавляй своё, не дожидаясь патча либы.
+> Пошаговое описание узлов — в [гайде](../USER_GUIDE.md).
 
-Ниже — четыре типичных сценария кастомизации:
+DSL — это набор extension-функций на `RunScope` плюс несколько hook'ов
+(`register`, `scopedResource`, `shared`, `guardWrite`, `errors.includeItem`,
+`@Tag(MigrationExecutor)`, `MigrationExit`). Если из коробки чего-то не хватает —
+добавляй своё, не дожидаясь патча либы.
+
+Все операции библиотеки (`jdbc`, `cassandra`, `kafka`, `topic`, `http`, `readCsv`,
+`openCsv`) — extension'ы именно на `RunScope`, а не на конкретный scope стадии. Поэтому
+твоя обёртка, написанная так же, автоматически работает во всех трёх контекстах: при
+загрузке `input`, при построении источника (`items = { }`) и в обработчике.
+
+Ниже — пять типичных сценариев кастомизации:
 
 1. [Свой ops-wrapper с dry-run gate](#1-свой-ops-wrapper-с-dry-run-gate)
-2. [Свой AutoCloseable-ресурс в lifecycle ctx](#2-свой-autocloseable-ресурс-в-lifecycle-ctx)
-3. [Кастомный Executor для `forEach`](#3-кастомный-executor-для-foreach)
-4. [Кастомный `Progress` + per-type сериализатор ошибок](#4-кастомный-progress--per-type-сериализатор-ошибок)
+2. [Свой асинхронный клиент под барьер `publish`](#2-свой-асинхронный-клиент-под-барьер-publish)
+3. [Свой ресурс в lifecycle: `register` и `scopedResource`](#3-свой-ресурс-в-lifecycle-register-и-scopedresource)
+4. [Кастомный Executor для стадий](#4-кастомный-executor-для-стадий)
+5. [Кастомный `Progress` + классификатор ошибок](#5-кастомный-progress--классификатор-ошибок)
 
 ---
 
@@ -26,13 +35,13 @@ Elasticsearch, внутренний RPC.
 // com/example/migrations/ops/S3Ops.kt
 package com.example.migrations.ops
 
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 import software.amazon.awssdk.services.s3.S3Client
 import software.amazon.awssdk.services.s3.model.PutObjectRequest
 import software.amazon.awssdk.core.sync.RequestBody
 
 class S3Ops internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val client: S3Client,
     private val bucket: String,
 ) {
@@ -62,7 +71,7 @@ class S3Ops internal constructor(
             .contents().map { it.key() }
 }
 
-fun MigrationContext.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
+fun RunScope.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
 ```
 
 Используется обычно:
@@ -72,14 +81,20 @@ fun MigrationContext.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, c
 class SampleMigration(
     private val s3client: S3Client,
     private val db: JdbcConnectionFactory,
-) : Migration("SAMPLE-001", "team") {
+) : MigrationDefinition {
 
-    override fun MigrationContext.migrate() {
-        val orders = jdbc(db).query("select id, payload from orders where status = 'EXPORT'") {
-            it.getLong("id") to it.getBytes("payload")
-        }
+    override val name = "SAMPLE-001"
 
-        forEach(orders, parallel = 4, onError = OnError.Skip) { (id, body) ->
+    override fun plan() = migration(name = name, author = "team") {
+        source(
+            parallel = 4,
+            onItemError = ItemError.Skip,
+            items = {
+                jdbc(db).query("select id, payload from orders where status = 'EXPORT'") {
+                    it.getLong("id") to it.getBytes("payload")
+                }.asSequence()
+            },
+        ) { (id, body) ->
             s3(s3client, "orders-archive").put("orders/$id.json", body)
         }
     }
@@ -89,29 +104,45 @@ class SampleMigration(
 Под `MIGRATION_DRY_RUN=true` ни одного реального `PutObject` не уйдёт; в отчёте появится
 `s3.put: 8421` и в логе `INFO [DRY-RUN] s3.put (bucket=orders-archive, key=orders/42.json, size=2048)`.
 
-**Что важно:** `guardWrite` — единственный канонический способ интегрироваться с dry-run.
-Сигнатур две: `guardWrite(label, args, dryRunDefault) { ... }` возвращает значение (под
-репетицией — `dryRunDefault`), `guardWrite(label, args) { ... }` — для void-записи. Значение
-`dryRunDefault` выбирай так, чтобы вызывающий код под репетицией шёл той же веткой, что и в
-бою: для HTTP-статуса это `200`, а не `0`; для «числа обновлённых строк» — `0`; для хендла —
-`null` только если вызывающий это переживает.
+**Что важно:** `guardWrite` — канонический способ интегрироваться с dry-run **изнутри
+операции**. Сигнатур две: `guardWrite(label, args, dryRunDefault) { ... }` возвращает значение
+(под репетицией — `dryRunDefault`), `guardWrite(label, args) { ... }` — для void-записи.
+Значение `dryRunDefault` выбирай так, чтобы вызывающий код под репетицией шёл той же веткой,
+что и в бою: для HTTP-статуса это `200`, а не `0`; для «числа обновлённых строк» — `0`;
+для хендла — `null` только если вызывающий это переживает.
 
 Read-операции (`listKeys`, `getObject`) НЕ оборачивай в `guardWrite` — они должны работать
 под dry-run.
 
-### Хендл, который зовут внутри `forEach`
+### `guardWrite` или `write`?
+
+Оба ведут в один и тот же гейт, но живут на разных уровнях и не заменяют друг друга:
+
+| | `guardWrite(label, args, dryRunDefault) { }` | `write(name, args) { ...: WriteOutcome }` |
+|---|---|---|
+| Кто пишет | автор операции — внутри неё | автор миграции — в обработчике |
+| Где доступен | `RunScope` (везде) | `HandlerScope` (только в теле стадии) |
+| Что видно в отчёте | `dryRunSkipped[label]` | `dryRunSkipped[name]`, `appliedWrites[name]`, `rejectedWrites[name]` |
+| Понятие «ожидаемо отклонено» | нет | есть — `WriteOutcome.Rejected(reason)` |
+
+Правило: **операцию** гейтишь `guardWrite`'ом один раз при её написании; **чужой компонент**
+(типизированный Kora-клиент, репозиторий, SDK без обёртки) — `write { }` на месте вызова.
+Оборачивать свою уже гейтованную операцию ещё и в `write` не нужно: под dry-run тело `write`
+не выполняется, и внутренний `guardWrite` до своего счётчика просто не доедет.
+
+### Хендл, который зовут внутри обработчика
 
 `s3(client, bucket)` в примере выше создаёт новый `S3Ops` на каждый вызов. Пока он живёт
 в переменной над циклом — это ничего не стоит. Но если хендл дёргается прямо в теле
-`forEach` на миллионе item'ов и при этом что-то держит (соединение, буфер, счётчики),
-объекты нужно мемоизировать — для этого есть `MigrationContext.shared(key, factory)`:
+обработчика на миллионе item'ов и при этом что-то держит (соединение, буфер, счётчики),
+объекты нужно мемоизировать — для этого есть `RunScope.shared(key, factory)`:
 ресурс создаётся один раз на прогон для данного ключа и сразу регистрируется в реестре
-(runner закроет его в `finally`). Ровно так внутри устроены `kafka(producer)` и
+(движок закроет его в `finally`). Ровно так внутри устроены `kafka(producer)` и
 `topic(producer, name)`.
 
 ```kotlin
 class S3Ops internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val client: S3Client,
     private val bucket: String,
 ) : AutoCloseable {                       // shared требует AutoCloseable
@@ -126,84 +157,160 @@ class S3Ops internal constructor(
 /** Ключ мемоизации: идентичность клиента плюс имя бакета. */
 private data class S3Key(val client: S3Client, val bucket: String)
 
-fun MigrationContext.s3(client: S3Client, bucket: String): S3Ops =
+fun RunScope.s3(client: S3Client, bucket: String): S3Ops =
     shared(S3Key(client, bucket)) { S3Ops(this, client, bucket) }
 ```
 
-Ограничение одно: `factory` не должна сама звать `shared` — вложенный вызов на той же
-мапе заблокируется.
+Ограничение одно: `factory` не должна сама звать `shared` — вложенный вызов идёт на той же
+`ConcurrentHashMap.computeIfAbsent`, а его поведение при рекурсивной модификации не определено.
 
 **Retry для S3 transient-ошибок** — навешивай на уровень `S3Client` (AWS SDK сам поддерживает
 `RetryPolicy` через `ClientOverrideConfiguration`). Item-level retry в DSL отсутствует
-по той же причине, что и для HTTP — повтор тела `forEach`-блока ломает non-idempotent шаги
-(см. USER_GUIDE §6 «Retry — на другом уровне»).
+по той же причине, что и для HTTP: повтор тела обработчика ломает non-idempotent шаги,
+уже выполненные до сбоя.
 
 ---
 
-## 2. Свой AutoCloseable-ресурс в lifecycle ctx
+## 2. Свой асинхронный клиент под барьер `publish`
 
-Допустим, нужен rate limiter, который должен жить всю миграцию и закрыться (например, сбросить
-оставшиеся в очереди задачи) в конце. `MigrationContext.register(closeable)` — твоя точка входа.
+`write { }` подходит для синхронного вызова: он завершился — значит записалось. Для
+клиента, который отдаёт `CompletionStage` и подтверждает доставку позже, есть `publish`:
+
+```kotlin
+publish("crm.notify", args = mapOf("customerId" to c.id)) {
+    crmClient.notifyAsync(c.id)      // возвращает CompletionStage<*>
+}
+```
+
+Что делает движок и чего не нужно писать руками:
+
+- регистрирует stage в барьере **своего scope'а** — стадия не завершится, пока всё
+  отправленное не подтвердится; в `scoped`-стадии барьер стоит на каждом родителе;
+- считает исходы: `acknowledgedPublishes`, `failedEffects`, `abandonedPublishes`
+  (не дождались за `completionTimeout`), `lateRegistered` (зарегистрировано после барьера);
+- аудитит каждый отказ в `errors.csv` вместе с item'ом, на котором он был отправлен;
+- под dry-run **не вызывает** лямбду вообще и не создаёт фальшивый future — поэтому
+  `publish` ничего и не возвращает: возвращать было бы нечего.
+
+Единственное требование к твоему клиенту — отдать `java.util.concurrent.CompletionStage`.
+Если у него callback-API, заверни сам:
+
+```kotlin
+fun RunScope.crm(client: CrmClient): CrmOps = shared(client) { CrmOps(client) }
+
+class CrmOps internal constructor(private val client: CrmClient) : AutoCloseable {
+
+    /** Мост callback → CompletionStage. Гейт здесь НЕ нужен: его ставит publish. */
+    fun notifyAsync(id: String): CompletionStage<Unit> {
+        val cf = CompletableFuture<Unit>()
+        client.notify(id) { err -> if (err == null) cf.complete(Unit) else cf.completeExceptionally(err) }
+        return cf
+    }
+
+    override fun close() { /* дренаж очереди клиента, если он у него есть */ }
+}
+```
+
+**Отказ асинхронного эффекта не проходит через `ItemError`** и не может: к моменту, когда
+известен исход доставки, item давно посчитан успешным, и `Skip` для него физически
+неприменим. Любой такой отказ валит стадию на барьере (`ScopeEffectsFailed`), а
+не-дождавшиеся — `ScopeCompletionTimeout`. Отправленное при этом не отзывается: оно уходит
+в отчёт отдельной строкой, потому что молча исчезать не имеет права.
+
+---
+
+## 3. Свой ресурс в lifecycle: `register` и `scopedResource`
+
+Две разные точки, и путать их дорого.
+
+### `register(closeable)` — на весь прогон
+
+Ресурс живёт от создания до конца прогона, закрывается движком в `finally` в порядке,
+обратном регистрации. Это то, что делают за тебя `openCsv`, `topic(...)`, `shared(...)`.
 
 ```kotlin
 // com/example/migrations/RateLimiterResource.kt
 package com.example.migrations
 
 import com.google.common.util.concurrent.RateLimiter
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 
-class ThrottledClient(
-    private val rps: Double,
-) : AutoCloseable {
+class ThrottledClient(rps: Double) : AutoCloseable {
     private val limiter = RateLimiter.create(rps)
 
     fun acquire() { limiter.acquire() }
 
     override fun close() {
-        // tx, оставшиеся задачи, и т.д. — кастомная логика
+        // сброс очереди, финализация, метрики — кастомная логика
     }
 }
 
-fun MigrationContext.throttler(rps: Double): ThrottledClient {
-    val t = ThrottledClient(rps)
-    register(t)        // runner закроет в `finally` после migrate()
-    return t
-}
+/**
+ * Один лимитер на прогон: `shared` создаёт его ровно один раз для данного ключа и сам
+ * зовёт `register`, поэтому звать фабрику из параллельных воркеров безопасно.
+ *
+ * Голый `register(ThrottledClient(rps))` тоже валиден, но тогда единственность — на тебе:
+ * вызов в теле обработчика создаст по лимитеру на каждый item, и «50 rps» превратятся
+ * в 50 rps на элемент.
+ */
+fun RunScope.throttler(rps: Double): ThrottledClient =
+    shared(ThrottleKey(rps)) { ThrottledClient(rps) }
+
+private data class ThrottleKey(val rps: Double)
 ```
 
-В скрипте:
+В плане:
 
 ```kotlin
-override fun MigrationContext.migrate() {
-    val throttle = throttler(rps = 50.0)            // 50 запросов в секунду
-    val client = ExternalApiClient(...)
-
-    forEach(items, parallel = 8) { item ->
+override fun plan() = migration(name = name, author = "team") {
+    source(parallel = 8, items = { sequenceOf(/* ... */) }) { item ->
+        val throttle = throttler(rps = 50.0)
         throttle.acquire()
         client.process(item)
     }
 }
 ```
 
-`runner` гарантирует, что `ThrottledClient.close()` будет вызван даже если `migrate()`
-бросил исключение — это часть [lifecycle-контракта](../USER_GUIDE.md#16-outputfolder-и-артефакты-прогона).
+Закрытие гарантировано, даже если стадия бросила исключение. Исключение из самого `close()`
+наверх не пробрасывается: оно уезжает WARN'ом в лог и строкой в `report.warnings`,
+exit-код от этого не меняется.
+
+### `scopedResource { }` — на границу scope'а
+
+Живёт на `SourceScope`, то есть внутри `items = { }`, и закрывает ресурс на границе
+**текущего scope'а**. В плоской стадии это конец стадии; в `scoped`-стадии — граница
+родителя: ресурс закроется перед тем, как откроется следующий родитель, а не в конце прогона.
+
+```kotlin
+scoped(
+    parents = { resolve(segments).asSequence() },
+    items = { segment ->
+        val cursor = legacy.openCursor(segment)      // держит соединение
+        scopedResource { cursor.close() }            // закроется на границе этого родителя
+        cursor.asSequence()
+    },
+) { row -> /* ... */ }
+```
+
+Порядок на границе строгий: сначала барьер подтверждений, потом закрытие ресурсов. Иначе
+соединение, через которое шла отправка, закрылось бы раньше, чем придут ack'и.
 
 Применения помимо rate limiter:
-- Streaming-handle (отправляешь данные в S3 multi-part upload — `close()` финализирует upload).
-- Metric reporter, который накопил counters во время прогона и хочет flush'нуть на закрытии.
-- Custom file format writer (JSON Lines, Parquet, etc.) — открываешь `BufferedWriter` сверху,
-  закрываешь через ctx.
+- Streaming-handle (S3 multi-part upload — `close()` финализирует upload).
+- Metric reporter, накопивший counters во время прогона и флашащий их на закрытии.
+- Custom file format writer (JSON Lines, Parquet) — открываешь `BufferedWriter` сверху,
+  закрываешь через реестр.
 
 ---
 
-## 3. Кастомный Executor для `forEach`
+## 4. Кастомный Executor для стадий
 
 По умолчанию runner создаёт **cached**-пул (`Executors.newCachedThreadPool`) с daemon-потоками
 `migration-<name>-<n>`. Cached, а не fixed, — потому что реальное число воркеров задаёт
-аргумент `forEach(parallel = N)` через свой семафор, и пул обязан уметь выдать столько потоков,
-сколько попросили: иначе `parallel` был бы декорацией, а вложенный `forEach` вставал бы намертво
-на исчерпании фиксированного пула. `migration.defaults.parallel` на размер пула не влияет — это
-лишь значение аргумента `parallel` по умолчанию.
+аргумент `source(parallel = N)` / `scoped(parallel = N)` через свой семафор, и пул обязан уметь
+выдать столько потоков, сколько попросили: иначе `parallel` был бы декорацией.
+`migration.defaults.parallel` на размер пула не влияет — это лишь значение аргумента
+`parallel` по умолчанию.
 
 Хочешь свой пул (с MDC, метриками, виртуальными потоками) — опубликуй в графе
 `Executor` с тегом `@Tag(MigrationExecutor::class)`. Фабрика должна жить в **`@Module`**:
@@ -252,14 +359,13 @@ Runner подхватит executor через `Optional<Executor>`-инжект 
 
 Две вещи, о которых надо помнить, подменяя пул:
 
-- **Пул должен выдавать столько потоков, сколько просит самый жадный `forEach`.** Fixed-пул на
-  32 потока при `forEach(parallel = 64)` тихо ограничит параллелизм 32-мя, а вложенный
-  `forEach(parallel > 1)` на исчерпанном fixed-пуле может встать в deadlock. Cached или
+- **Пул должен выдавать столько потоков, сколько просит самая жадная стадия.** Fixed-пул на
+  32 потока при `parallel = 64` тихо ограничит параллелизм 32-мя. Cached или
   virtual-threads пул этой проблемы не имеют.
 - **Свой пул runner не гасит.** Дефолтный он регистрирует как `AutoCloseable` и останавливает
   сам (`shutdown()` + ожидание 30 с, потом `shutdownNow()` с предупреждением в отчёт). Кастомный
-  считается собственностью пользователя — закрывай его сам (например, `register(AutoCloseable { pool.shutdown() })`
-  в начале `migrate()`).
+  считается собственностью пользователя — закрывай его сам (например,
+  `register(AutoCloseable { pool.shutdown() })` в первом же `items = { }`).
 
 Применения:
 - MDC propagation — твой `ThreadFactory` копирует `MDC.getCopyOfContextMap()` из main-thread.
@@ -268,84 +374,93 @@ Runner подхватит executor через `Optional<Executor>`-инжект 
 
 ---
 
-## 4. Кастомный `Progress` + per-type сериализатор ошибок
+## 5. Кастомный `Progress` + классификатор ошибок
 
 `Progress.Custom(n) { done, total -> ... }` принимает любую лямбду — можно тянуть state из
 скрипта для составного лога. Полезно когда стандартного `"X/Y done"` мало.
 
 ```kotlin
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.OnError
+import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.MigrationDefinition
 import io.github.dsudomoin.migration.Progress
+import io.github.dsudomoin.migration.WriteOutcome
 import io.github.dsudomoin.migration.error.includeItem
-import io.github.dsudomoin.migration.forEach
+import io.github.dsudomoin.migration.migration
 import ru.tinkoff.kora.http.client.common.HttpClientResponseException
 import java.util.concurrent.atomic.AtomicLong
 
-class SampleMigration(...) : Migration("SAMPLE-001", "team") {
+class SampleMigration(/* ... */) : MigrationDefinition {
+
+    override val name = "SAMPLE-001"
 
     private val ok = AtomicLong()
     private val skipped = AtomicLong()
-    private val processed4xx = AtomicLong()
+    private val rejected4xx = AtomicLong()
     private val startMs = System.currentTimeMillis()
 
-    override fun MigrationContext.migrate() {
-        errors.includeItem<Order> { "id=${it.id}, customer=${it.customerId}, amount=${it.amount}" }
-
-        forEach(
-            items,
+    override fun plan() = migration(name = name, author = "team") {
+        source(
             parallel = 8,
-            onError = OnError.handle { e, _ ->
+            onItemError = ItemError.Handle { e, order ->
                 when {
                     // Не-2xx от типизированного Kora-клиента прилетает как
                     // HttpClientResponseException (у http(call) — как HttpStatusException).
                     e is HttpClientResponseException && e.code in 400..499 -> {
-                        processed4xx.incrementAndGet()
-                        OnError.Decision.Skip
+                        rejected4xx.incrementAndGet()
+                        ItemError.Decision.Skip
                     }
                     // 5xx ретраится Kora @Retry внутри HTTP-клиента; сюда попадает только
                     // финальный fail после исчерпания retries — аудитим и идём дальше.
-                    e is HttpClientResponseException -> OnError.Decision.Skip
-                    e is ValidationException         -> OnError.Decision.Skip   // свой доменный тип
-                    else                             -> OnError.Decision.Fail
+                    e is HttpClientResponseException -> ItemError.Decision.Skip
+                    e is ValidationException         -> ItemError.Decision.Skip   // свой доменный тип
+                    // Классификатор видит типизированный item, а не Any? — решение может
+                    // зависеть и от самих данных.
+                    order.amount > 1_000_000         -> ItemError.Decision.Fail
+                    else                             -> ItemError.Decision.Skip
                 }
             },
             progress = Progress.Custom(500) { done, total ->
                 val elapsedS = ((System.currentTimeMillis() - startMs) / 1000).coerceAtLeast(1)
                 val rate = done / elapsedS
                 val pct = if (total != null) " (${done * 100 / total}%)" else ""
-                "progress: $done/${total ?: "?"}$pct  ok=${ok.get()}  skip=${skipped.get()}  4xx=${processed4xx.get()}  rate=${rate}/s"
+                "progress: $done/${total ?: "?"}$pct  ok=${ok.get()}  skip=${skipped.get()}  4xx=${rejected4xx.get()}  rate=${rate}/s"
             },
-        ) { item ->
-            try {
-                process(item)
-                ok.incrementAndGet()
-            } catch (e: Exception) {
-                val is4xx = e is HttpClientResponseException && e.code in 400..499
-                if (!is4xx) skipped.incrementAndGet()
-                throw e
+            items = {
+                errors.includeItem<Order> { "id=${it.id}, customer=${it.customerId}, amount=${it.amount}" }
+                loadOrders()
+            },
+        ) { order ->
+            write("order.sync", args = mapOf("id" to order.id)) {
+                process(order)
+                WriteOutcome.Applied
             }
+            ok.incrementAndGet()
         }
     }
-
-    private fun process(item: Order) { /* ... */ }
 }
 ```
 
-Что здесь нового:
+Что здесь используется:
+
 - **`errors.includeItem<Order> { ... }`** — кастомный сериализатор. Когда `Order` попадёт в
-  `errors.csv` через автоматический аудитор, рендер пойдёт через эту лямбду, а не через `toString()`.
-- **`OnError.handle { ... }`** — domain-классификатор по типу исключения. Для каждого типа —
-  своё решение (`Decision.Skip` / `Decision.Fail`). Retry в DSL нет: backoff навешивай на
-  Kora `@Retry` внутри клиента (см. http-backfill-archetype).
-- **`Progress.Custom(500) { ... }`** — кастомный форматтер, тянет `AtomicLong`-счётчики и
-  считает скорость на лету.
+  `errors.csv` через автоматический аудитор, рендер пойдёт через эту лямбду, а не через
+  `toString()`. Регистрируется в `items = { }`: этот блок выполняется до первого обработчика.
+  Lookup идёт по классу, потом по супертипам и интерфейсам — `includeItem<Map<*, *>>`
+  сработает и для `LinkedHashMap`.
+- **`ItemError.Handle { e, item -> ... }`** — классификатор, получающий **типизированный**
+  item. Retry в DSL нет: backoff навешивай на Kora `@Retry` внутри клиента (см.
+  [http-backfill-archetype.md](http-backfill-archetype.md)).
+- **`Progress.Custom(500) { ... }`** — форматтер, тянущий `AtomicLong`-счётчики и считающий
+  скорость на лету. Есть ещё `Progress.Every(n)` (дефолтный формат с другим периодом),
+  `Progress.Default` и `Progress.Off`.
+
+`total` в форматтере — `null` для последовательных источников: длина `Sequence` заранее
+неизвестна, и врать про проценты движок не станет.
 
 Применения:
 - Прогресс с throughput-метрикой и распределением по типам ошибок.
-- Прогресс с разбивкой по сегментам (например, по тенанту: `tenant_a=120, tenant_b=450`).
-- Прогресс, который вместо лога пишет в внешнюю метрику (тогда `format` дёргает свой
+- Прогресс с разбивкой по сегментам (`tenant_a=120, tenant_b=450`).
+- Прогресс, который вместо лога пишет во внешнюю метрику (тогда `format` дёргает свой
   `meterRegistry.counter(...)` и возвращает короткую строку для лога).
 
 ---
@@ -356,19 +471,23 @@ class SampleMigration(...) : Migration("SAMPLE-001", "team") {
 
 | Что | Как |
 |---|---|
-| Альтернативный формат CSV (JSON Lines, Parquet) | Своя имплементация `AutoCloseable`-writer'а + extension `MigrationContext.openJsonl(...)`, регистрируемая через `register()` |
+| Перехват exit-кода вместо `exitProcess` | Объяви в графе компонент `MigrationExit` (`fun interface MigrationExit { fun exit(code: Int) }`) — runner отдаст код в него и не убьёт JVM. Нужно тестам на настоящем графе (см. [`KoraWireUpTest`](../../example/src/test/kotlin/io/github/dsudomoin/migration/example/KoraWireUpTest.kt)) и встраиванию runner'а в приложение, которое живёт дальше |
+| Альтернативный формат выхода (JSON Lines, Parquet) | Своя имплементация `AutoCloseable`-writer'а + extension `RunScope.openJsonl(...)`, регистрируемая через `register()`. Обрати внимание: встроенный `output(...)` объявляется в билдере именно потому, что должен открываться один раз на прогон — свой writer открывай так же, а не внутри `items` у `scoped`-стадии |
 | Кастомный HTTP-клиент (OkHttp / HttpURLConnection) | Передай `HttpCall` лямбду в `http(call)`. См. [http-backfill-archetype.md](http-backfill-archetype.md) §«Вариация: http()» |
-| Свой error-reporter (не CSV, а Kibana / Sentry) | `MigrationContext.errors` типизирован как конкретный `CsvFileErrorReporter` (а не интерфейс) — стандартный runner всегда даёт CSV. Чтобы заменить: либо `open` `CsvFileErrorReporter.report(...)` через subclass и подсунуть его в `DefaultMigrationContext.internalCreate(...)` в своём `Lifecycle`-компоненте; либо форкнуть `MigrationRunner` и интанцировать свой `ErrorReporter`-impl. Pluggable из коробки нет — это сознательное решение (см. AGENTS.md §15.2) |
-| Не-Kora приложение | Подключи только `migration-dsl-core` (без `migration-dsl-kora`), создавай `DefaultMigrationContext.internalCreate(...)` сам — фабрика на companion-объекте публичная |
-| Перехват exit-кода вместо `exitProcess` | Объяви в графе компонент `MigrationExit` (`fun interface MigrationExit { fun exit(code: Int) }`) — runner отдаст код в него и не убьёт JVM. Нужно тестам на настоящем графе и встраиванию runner'а в приложение, которое живёт дальше |
+| Свой error-reporter (не CSV, а Kibana / Sentry) | `RunScope.errors` типизирован как конкретный `CsvFileErrorReporter` (а не интерфейс) — стандартный runner всегда даёт CSV. Чтобы заменить: либо переопредели `open fun report(...)` в subclass'е `CsvFileErrorReporter` и передай его в `RunContext.internalCreate(...)` из своего `Lifecycle`-компонента; либо форкни `MigrationRunner`. Pluggable из коробки нет — это сознательное решение |
+| Не-Kora приложение | Подключи только `migration-dsl-core` (без `migration-dsl-kora`), собери `RunContext.internalCreate(...)` сам и отдай план в `PlanInterpreter(ctx).execute(plan)` — обе фабрики публичные. Так устроены тесты библиотеки, включая [pilot-тест архетипа сравнения](../../kora/src/test/kotlin/io/github/dsudomoin/migration/kora/pilot/ComparisonPilotTest.kt) |
 | Программный конфиг без HOCON | `MigrationConfigValues` / `DefaultsValues` / `ErrorReportingValues` / `ReportValues` — data-классы с дефолтами, реализующие `MigrationConfig`. Удобны в тестах и при встраивании runner'а |
+| Своя политика на unhandled-ошибку | `migration(name, author, onUnhandled = ScriptPolicy.LOG_AND_COMPLETE) { }` — параметр билдера перекрывает `migration.defaults.onUnhandled` для конкретной миграции |
 
 ## Что НЕ стоит кастомизировать
 
-- **`ForEachEngine`** — internal-класс, сигнатуры могут меняться между minor-версиями
-  без deprecation. Если кажется, что нужно — открой issue.
-- **`MigrationContext` сам по себе** (как интерфейс) — кастомные реализации сломаются на
-  следующей версии при добавлении новых членов в интерфейс. Используй [`DefaultMigrationContext`](../../core/src/main/kotlin/io/github/dsudomoin/migration/internal/DefaultMigrationContext.kt)
-  через его фабрики.
-- **`Migration.migrate()` вне `MigrationContext`-receiver** — runner полагается на extension-receiver
-  для прокидывания контекста. Не пытайся подменить.
+- **`PlanInterpreter` и `RunContext`** — публичны ради Kora-модуля и тестов, но их
+  сигнатуры могут меняться между minor-версиями без deprecation. Используй фабрики
+  (`RunContext.test`, `RunContext.internalCreate`), а не конструкторы.
+- **Собственные реализации `RunScope` / `SourceScope` / `HandlerScope`** — сломаются на
+  следующей версии при добавлении членов в интерфейс. Внутри всё равно один и тот же объект:
+  scope'ы разделены только типами на границе DSL.
+- **Регистрация стадий во время исполнения.** `@DslMarker` (`@MigrationDsl`) запрещает вызвать
+  `source`/`scoped`/`input`/`output` изнутри `items` и `handle` — это ошибка компиляции, и
+  обходить её кастами не надо: план неизменяем, и мутировать его на ходу означало бы иметь
+  два разных плана у одного прогона.

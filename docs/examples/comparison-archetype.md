@@ -1,11 +1,13 @@
 # Пример: Comparison-архетип
 
+> Пошаговое описание узлов — в [гайде](../USER_GUIDE.md).
+
 **Задача.** По тикету SAMPLE-001 после миграции с одного Cassandra-кластера
 на другой DBA хочет получить полный список контрактов, у которых значение
 `value` различается между `primary` и `replica`. Никаких записей —
 только diff-репорт.
 
-Это «read-only» архетип: чисто аналитический скрипт, ноль side-effects.
+Это «read-only» архетип: чисто аналитический план, ноль side-effects.
 
 ## Setup
 
@@ -13,6 +15,8 @@
 [resend-archetype.md §2–3, §8](resend-archetype.md); прогон архетипа целиком против
 двух реальных кластеров — в
 [pilot-тесте](../../kora/src/test/kotlin/io/github/dsudomoin/migration/kora/pilot/ComparisonPilotTest.kt).
+Это буквально этот архетип на новом API: `output` × 2, одна стадия, `.chunked(...)`
+в источнике — можно смотреть как на исполняемую версию текста ниже.
 В сборке нужен `database-cassandra` модуль Kora. Два `CqlSession` под `@Tag`
 регистрируются своим `@Module` — тем же приёмом, что и вторая JDBC-база в
 [correction-archetype.md](correction-archetype.md); из библиотеки в `@KoraApp`
@@ -58,7 +62,6 @@ sample {
   inputFile  = "input/contracts.csv"
   batchSize  = 200
   parallel   = 4
-  initialContractId = null
   initialContractId = ${?SAMPLE_INITIAL_CONTRACT}
 }
 ```
@@ -75,12 +78,12 @@ class PrimaryCluster
 class ReplicaCluster
 
 @ConfigSource("sample")
-data class SampleConfig(
-    var inputFile: String,
-    var batchSize: Int,
-    var parallel: Int,
-    var initialContractId: String?,
-)
+interface SampleConfig {
+    fun inputFile(): String
+    fun batchSize(): Int = 200
+    fun parallel(): Int = 4
+    fun initialContractId(): String?     // отсутствует в конфиге → null
+}
 ```
 
 ## Скрипт
@@ -89,13 +92,12 @@ data class SampleConfig(
 package com.example.migrations
 
 import com.datastax.oss.driver.api.core.CqlSession
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.OnError
-import io.github.dsudomoin.migration.csv.openCsv
+import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.MigrationDefinition
 import io.github.dsudomoin.migration.csv.readCsv
-import io.github.dsudomoin.migration.forEach
+import io.github.dsudomoin.migration.error.includeItem
 import io.github.dsudomoin.migration.kora.ops.cassandra
+import io.github.dsudomoin.migration.migration
 import ru.tinkoff.kora.common.Component
 import ru.tinkoff.kora.common.Tag
 
@@ -104,17 +106,35 @@ class SampleMigration(
     @Tag(PrimaryCluster::class) private val primary: CqlSession,
     @Tag(ReplicaCluster::class) private val replica: CqlSession,
     private val config: SampleConfig,
-) : Migration(name = "SAMPLE-001", author = "dba") {
+) : MigrationDefinition {
 
-    override fun MigrationContext.migrate() {
-        val contracts = readCsv(config.inputFile) { it["contract"]!! }
-            .filter { config.initialContractId == null || it > config.initialContractId!! }
-            .toList()
+    override val name = "SAMPLE-001"
 
-        val mismatches = openCsv("mismatches.csv", "contract", "primary", "replica")
-        val missingOnReplica = openCsv("missing-on-replica.csv", "contract", "primary")
+    override fun plan() = migration(name = name, author = "dba") {
+        val mismatches = output("mismatches.csv", "contract", "primary", "replica")
+        val missingOnReplica = output("missing-on-replica.csv", "contract", "primary")
 
-        forEach(contracts, chunk = config.batchSize, parallel = config.parallel, onError = OnError.Skip) { batch ->
+        // Ошибка конфига должна быть видна до первого запроса в кластеры, а не на середине.
+        validate {
+            require(config.batchSize() > 0) { "sample.batchSize должен быть > 0" }
+            require(config.parallel() > 0) { "sample.parallel должен быть > 0" }
+        }
+
+        source(
+            parallel = config.parallel(),
+            onItemError = ItemError.Skip,
+            items = {
+                errors.includeItem<List<String>> { "batch of ${it.size}, first=${it.firstOrNull()}" }
+
+                // Локальная переменная, а не config.initialContractId() внутри filter:
+                // у метода интерфейса нет smart cast, и сравнение с null пришлось бы писать дважды.
+                val from = config.initialContractId()
+
+                readCsv(config.inputFile()) { it.getValue("contract") }
+                    .filter { from == null || it > from }
+                    .chunked(config.batchSize())
+            },
+        ) { batch ->
             val p = cassandra(primary)
                 .query("select id, value from t.items where id in :ids", "ids" to batch) { it.getString("id") to it.getString("value") }
                 .toMap()
@@ -136,16 +156,44 @@ class SampleMigration(
 }
 ```
 
+Три вещи, которые изменились по сравнению со старым API и на которые стоит посмотреть:
+
+- **Оба выхода объявлены в билдере**, а не в теле. Файл открывается один раз на прогон,
+  заголовки задаются один раз, закрывает его движок — писать `close()` не нужно и негде.
+- **Батчинг — обычный `Sequence.chunked(N)`**, отдельного параметра `chunk` у стадии больше
+  нет. Ленивость сохраняется: миллион строк из CSV не материализуется, режется на лету.
+- **`items = { }` выполняется один раз, до первого обработчика** — поэтому регистрация
+  сериализаторов (`errors.includeItem`) живёт именно там.
+
 `parallel = 4` — это четыре реально работающих воркера: пул runner'а cached и выдаёт
-столько потоков, сколько запросил конкретный `forEach`. `migration.defaults.parallel`
+столько потоков, сколько запросила конкретная стадия. `migration.defaults.parallel`
 задаёт лишь значение аргумента по умолчанию, если его не написали явно. Четыре батча
 = до восьми одновременных запросов (по два на батч), их разруливает пул соединений
 самого драйвера — `advanced.connection.pool.localSize` в конфиге кластера.
 
-`readCsv` по умолчанию `onRowError = OnError.Fail`: битая строка входного файла валит
+`readCsv` по умолчанию `onRowError = ItemError.Fail`: битая строка входного файла валит
 прогон. Если список контрактов приезжает из чужой выгрузки, лучше
-`readCsv(config.inputFile, onRowError = OnError.Skip) { it["contract"]!! }` — строка
-уедет в `errors.csv` и посчитается в `errorThreshold`, а сравнение продолжится.
+`readCsv(config.inputFile(), onRowError = ItemError.Skip) { it.getValue("contract") }` —
+строка уедет в `errors.csv` и в счётчик `report.sourceSkipped` (`Source rows dropped`
+в отчёте), а сравнение продолжится. В `errorThreshold` такие строки не считаются — порог
+сторожит ошибки обработки, а не грязь на входе.
+
+## Гранулярность и возобновление
+
+Item стадии — **батч**, а не контракт. Значит:
+
+- `ItemError.Skip` при отказе одного из кластеров теряет весь батч (200 контрактов),
+  и в `errors.csv` уедет одна строка — поэтому сериализатор зарегистрирован на
+  `List<String>`, а не на `String`;
+- `report.processed` считает батчи: 200 000 контрактов при `batchSize = 200` дадут
+  `Processed: 1 000`;
+- `errorThreshold` тоже считает батчи.
+
+Возобновление после падения — `initialContractId`: фильтр по возрастающему id
+отбрасывает уже сравнённое. Ровно этот сценарий проверяет второй тест пилота.
+Если сравнение достаточно длинное, чтобы курсор хотелось двигать автоматически,
+источником становится `pages(...)` вместо `readCsv` — см.
+[export-archetype.md](export-archetype.md#почему-pages-а-не-jdbcstream).
 
 ## Consistency: через DSL её не задать
 
@@ -182,14 +230,18 @@ private fun <T> CqlSession.selectQuorum(cql: String, ids: List<String>, mapper: 
 ```
 
 Чтение мимо DSL ничего не ломает: `query`/`stream` и так не проходят через dry-run
-гейт (репетиция обязана читать), а учёт item'ов ведёт `forEach`, а не op. Для
-**записи** так делать нельзя — она обязана идти через `execute`/`mutation`, иначе
-пройдёт мимо гейта и выполнится под dry-run по-настоящему.
+гейт (репетиция обязана читать), а учёт item'ов ведёт движок стадии, а не op. Для
+**записи** так делать нельзя — она обязана идти через `execute` или через
+`write("label") { ... }`, иначе пройдёт мимо гейта и выполнится под dry-run
+по-настоящему.
 
 ## Запуск
 
 ```bash
 MIGRATION_RUN=SAMPLE-001 ./gradlew run
+
+# Возобновить с места падения
+MIGRATION_RUN=SAMPLE-001 SAMPLE_INITIAL_CONTRACT=A-77123 ./gradlew run
 ```
 
 Артефакты — в `logs/SAMPLE-001/`:
@@ -206,31 +258,14 @@ logs/SAMPLE-001/
 
 | Фича | Где |
 |---|---|
+| `MigrationDefinition` + `plan()` | `name` — константа; план строится один раз и только у выбранной миграции |
 | Два source-кластера с `@Tag` | Constructor inject через `@Tag(PrimaryCluster::class)` и `@Tag(ReplicaCluster::class)` |
-| Two-tier CSV output | `openCsv` × 2, оба под `outputFolder` — никаких `csvSink` |
-| Чисто read-only | Ни `execute`, ни `mutation`, ни `topic.send` — side-effect'ов нет вовсе. `dryRun = true` и `false` ведут себя одинаково. Под репетицией runner допишет в лог и отчёт предупреждение «processed N item(s) but intercepted 0 writes» — оно ищет забытый `mutation { }`, и для этого архетипа ожидаемо |
-| Initial-id фильтр для возобновления | `.filter { it > config.initialContractId }` — если миграция упала на середине, рестартуешь с того же ID |
-| `OnError.Skip` | Если запрос к одному из кластеров упал — пропускаем батч (запишется в `errors.csv` авто-репортером), миграция продолжается |
-
-## Вариация: для миллиона контрактов — стрим из CSV
-
-Если входной CSV длинный (1M+ строк), материализовать в `List<String>` дорого:
-
-```kotlin
-val contracts = readCsv(config.inputFile) { it["contract"]!! }   // Sequence<String>
-
-forEach(contracts, chunk = 200, parallel = 4, onError = OnError.Skip) { batch ->
-    // тот же код
-}
-```
-
-`forEach` умеет работать с `Sequence` напрямую (есть отдельная перегрузка с `chunk`,
-режущая лениво). Память не расходуется на полный список — материализуется только
-текущий батч.
-
-Ранний выход из такого цикла безопасен: `readCsv` регистрирует открытый поток в
-контексте, и runner закроет дескриптор в `finally` даже если `Sequence` не
-дочитана до конца.
+| Two-tier CSV output | `output(...)` × 2 в билдере, оба под `outputFolder`, авто-закрытие |
+| `validate { }` | Проверка конфига один раз, до первой стадии и до любого запроса |
+| `.chunked(batchSize)` | Батчинг обычным `Sequence.chunked` — ради `where id in :ids`, а не ради движка |
+| Чисто read-only | Ни `execute`, ни `write`, ни `publish` — side-effect'ов нет вовсе. `dryRun = true` и `false` ведут себя одинаково. Под репетицией runner допишет в лог и отчёт предупреждение «processed N item(s) but intercepted 0 writes» — оно ищет забытый dry-run-гейт, и для этого архетипа ожидаемо |
+| Initial-id фильтр для возобновления | `.filter { from == null || it > from }` — если прогон упал на середине, рестартуешь с того же ID |
+| `ItemError.Skip` | Если запрос к одному из кластеров упал — пропускаем батч (запишется в `errors.csv` авто-репортером), сравнение продолжается |
 
 ## Вариация: значение — UDT (`frozen<money>`)
 
@@ -260,7 +295,11 @@ private fun Row.money(col: String): Money? =
 ```
 
 ```kotlin
-forEach(contracts, chunk = config.batchSize, parallel = config.parallel, onError = OnError.Skip) { batch ->
+source(
+    parallel = config.parallel(),
+    onItemError = ItemError.Skip,
+    items = { readCsv(config.inputFile()) { it.getValue("contract") }.chunked(config.batchSize()) },
+) { batch ->
     val p = cassandra(primary)
         .query("select contract, value from t.items where contract in :ids", "ids" to batch) {
             it.getString("contract") to it.money("value")
@@ -299,3 +338,38 @@ forEach(contracts, chunk = config.batchSize, parallel = config.parallel, onError
    только в `SELECT`), но если UDT понадобится **в условии** — собирай
    `BoundStatementBuilder` сам в custom op и передавай `GenericType`. См.
    [customization.md](customization.md).
+
+## Вариация: сравнение в две стадии
+
+Если после diff'а хочется отдельным проходом починить найденное, это вторая стадия —
+а не второй скрипт. Стадии идут строго последовательно, и починка не начнётся, если
+сравнение провалилось:
+
+```kotlin
+override fun plan() = migration(name = name, author = "dba") {
+    val mismatches = output("mismatches.csv", "contract", "primary", "replica")
+    val repaired = output("repaired.csv", "contract")
+
+    // Найденные расхождения живут в поле класса: между стадиями состояние передаётся
+    // обычным способом, движок для этого ничего не предлагает и не должен.
+    val found = java.util.concurrent.ConcurrentLinkedQueue<String>()
+
+    source(name = "compare", parallel = 4, onItemError = ItemError.Skip, items = { /* ... */ }) { batch ->
+        // ... сравнение; при расхождении:
+        // mismatches.row(id, pv, rv); found += id
+    }
+
+    source(name = "repair", parallel = 2, onItemError = ItemError.Skip, items = { found.asSequence() }) { id ->
+        write("replica.repair", args = mapOf("contract" to id)) {
+            cassandra(replica).execute("update t.items set value = :v where id = :id", "v" to "...", "id" to id)
+            WriteOutcome.Applied
+        }
+        repaired.row(id)
+    }
+}
+```
+
+`write(...)` здесь нужен не ради гейта — `cassandra.execute` проходит его сам, — а ради
+учёта: `appliedWrites["replica.repair"]` в отчёте покажет, сколько контрактов реально
+починено. Если бы отрицательный исход был штатным (строка не подошла), тело вернуло бы
+`WriteOutcome.Rejected("reason")` и он попал бы в `rejectedWrites` отдельно от сбоев.

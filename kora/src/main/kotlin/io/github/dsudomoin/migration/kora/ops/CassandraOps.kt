@@ -2,11 +2,16 @@ package io.github.dsudomoin.migration.kora.ops
 
 import com.datastax.oss.driver.api.core.CqlSession
 import com.datastax.oss.driver.api.core.cql.*
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 
 /**
- * Cassandra-операции: `query/stream/execute/batch` поверх [CqlSession]. Параметры —
+ * Cassandra-операции: `query/execute/batch` поверх [CqlSession]. Параметры —
  * named placeholders `:name`, биндинг автоматический.
+ *
+ * Ленивого `stream` здесь нет намеренно: он отдавал `Sequence` поверх авто-paging'а драйвера —
+ * без влияния на размер страницы, без учёта в отчёте и без контроля курсора. Для источника
+ * стадии есть `pages(...)`, для небольшой выборки — [query]. Два способа читать Cassandra —
+ * ровно то, из-за чего миграции получались императивными.
  *
  * Write-операции (`execute`, `batch`) идут через `guardWrite` — под dry-run пропускаются.
  *
@@ -17,24 +22,20 @@ import io.github.dsudomoin.migration.MigrationContext
  * слой здесь не нужен.
  */
 class CassandraOps internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val session: CqlSession,
 ) {
     private fun prepared(cql: String): PreparedStatement = session.prepare(cql)
 
-    /** Полное чтение результата в `List<T>`. Для больших выборок — [stream]. */
+    /**
+     * Полное чтение результата в `List<T>`.
+     *
+     * Для большой выборки бери `pages(...)`: он читает страницами по явному курсору, считает
+     * сырые страницы в отчёт и ловит неподвижный курсор. Авто-paging драйвера ничего из этого не
+     * умеет: размер страницы задаётся конфигом Kora и из DSL невидим.
+     */
     fun <T> query(cql: String, vararg params: Pair<String, Any?>, mapper: (Row) -> T): List<T> =
         session.execute(bind(cql, params)).map(mapper).toList()
-
-    /**
-     * Ленивая итерация: возвращает `Sequence<T>` поверх Cassandra-driver-курсора. Подходит для
-     * многомилионных `IN`-запросов, которые не помещаются в RAM. Driver сам делает paging.
-     */
-    fun <T> stream(cql: String, vararg params: Pair<String, Any?>, mapper: (Row) -> T): Sequence<T> = sequence {
-        val rs = session.execute(bind(cql, params))
-        val iter = rs.iterator()
-        while (iter.hasNext()) yield(mapper(iter.next()))
-    }
 
     /** `INSERT/UPDATE/DELETE` (Cassandra: CRUD-семантика немного другая, но guardWrite те же). */
     fun execute(cql: String, vararg params: Pair<String, Any?>): ResultSet? =
@@ -120,4 +121,4 @@ class CassandraOps internal constructor(
  * Фабрика [CassandraOps]. Для multi-кластерной миграции — два разных `CqlSession` через
  * `@Tag(...)` и `cassandra(primary)`, `cassandra(replica)`.
  */
-fun MigrationContext.cassandra(session: CqlSession): CassandraOps = CassandraOps(this, session)
+fun RunScope.cassandra(session: CqlSession): CassandraOps = CassandraOps(this, session)

@@ -1,8 +1,7 @@
 package io.github.dsudomoin.migration.csv
 
-import io.github.dsudomoin.migration.OnError
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
-import io.github.dsudomoin.migration.internal.ErrorThresholdExceeded
+import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
@@ -25,21 +24,21 @@ class CsvReadRowErrorTest {
 
     @Test
     fun `Skip пропускает битую строку, аудитит её и отдаёт остальные`(@TempDir dir: Path) {
-        val ctx = DefaultMigrationContext.test(outputFolder = dir.resolve("out"))
+        val ctx = RunContext.test(outputFolder = dir.resolve("out"))
 
         val rows = with(ctx) {
-            readCsv(csv(dir), onRowError = OnError.Skip) { it.getValue("spend").toLong() }.toList()
+            readCsv(csv(dir), onRowError = ItemError.Skip) { it.getValue("spend").toLong() }.toList()
         }
 
         assertThat(rows).containsExactly(100L, 300L)
-        assertThat(ctx.report.build().skipped).isEqualTo(1)
+        assertThat(ctx.report.build().sourceSkipped).isEqualTo(1)
         ctx.errors.close()
         assertThat(Files.readString(dir.resolve("out").resolve("errors.csv"))).contains("NumberFormatException")
     }
 
     @Test
     fun `Fail по умолчанию — битая строка валит чтение`(@TempDir dir: Path) {
-        val ctx = DefaultMigrationContext.test(outputFolder = dir.resolve("out"))
+        val ctx = RunContext.test(outputFolder = dir.resolve("out"))
 
         val thrown = catchThrowable {
             with(ctx) { readCsv(csv(dir)) { it.getValue("spend").toLong() }.toList() }
@@ -49,26 +48,23 @@ class CsvReadRowErrorTest {
     }
 
     @Test
-    fun `пропущенные строки считаются в errorThreshold`(@TempDir dir: Path) {
-        val ctx = DefaultMigrationContext.test(outputFolder = dir.resolve("out"), errorThreshold = 0)
+    fun `пропущенные строки считаются отдельно от item-skip`(@TempDir dir: Path) {
+        // Порог ошибок больше не живёт в readCsv: он считается по стадии. И отброшенная строка
+        // не является item-skip'ом — до стадии она не дошла, поэтому счётчик отдельный.
+        val ctx = RunContext.test(outputFolder = dir.resolve("out"))
         val f = dir.resolve("many.csv")
         Files.writeString(f, "id,spend\n1,X\n2,Y\n")
 
-        // threshold = 0 означает «выключено», поэтому проверяем на пороге 1
-        val strict = DefaultMigrationContext.test(outputFolder = dir.resolve("out2"), errorThreshold = 1)
-        val thrown = catchThrowable {
-            with(strict) { readCsv(f, onRowError = OnError.Skip) { it.getValue("spend").toLong() }.toList() }
-        }
+        val rows = with(ctx) { readCsv(f, onRowError = ItemError.Skip) { it.getValue("spend").toLong() }.toList() }
 
-        assertThat(thrown).isInstanceOf(ErrorThresholdExceeded::class.java)
-        assertThat(with(ctx) { readCsv(f, onRowError = OnError.Skip) { it.getValue("spend").toLong() }.toList() })
-            .describedAs("threshold = 0 — проверка отключена, обе строки просто пропускаются")
-            .isEmpty()
+        assertThat(rows).isEmpty()
+        assertThat(ctx.report.build().sourceSkipped).isEqualTo(2)
+        assertThat(ctx.report.build().skipped).describedAs("item-skip здесь не при чём").isZero()
     }
 
     @Test
     fun `недопотреблённая последовательность не оставляет открытый дескриптор`(@TempDir dir: Path) {
-        val ctx = DefaultMigrationContext.test(outputFolder = dir.resolve("out"))
+        val ctx = RunContext.test(outputFolder = dir.resolve("out"))
 
         // take(1) бросает корутину генератора на полпути: use-блок внутри неё не доигрывает,
         // и без регистрации в реестре поток остался бы открытым до конца процесса.

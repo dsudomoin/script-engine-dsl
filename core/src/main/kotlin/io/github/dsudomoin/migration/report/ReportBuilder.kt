@@ -8,9 +8,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Thread-safe аккумулятор статистики прогона. Инкрементируется автоматически из `forEach`-движка
+ * Thread-safe аккумулятор статистики прогона. Инкрементируется автоматически интерпретатором плана
  * и `guardWrite`. Пользователю напрямую дёргать счётчики не нужно — доступ к нему через
- * [io.github.dsudomoin.migration.MigrationContext.report] полезен в основном для прогресс-форматтеров (`Progress.Custom`).
+ * [io.github.dsudomoin.migration.RunScope.report] полезен в основном для прогресс-форматтеров (`Progress.Custom`).
  *
  * @param startedAt момент создания (≈ старт прогона). Дефолт `Instant.now()`.
  */
@@ -24,8 +24,16 @@ class ReportBuilder(
     private val successful = AtomicLong()
     private val skipped = AtomicLong()
     private val failed = AtomicLong()
-    private val asyncFailed = AtomicLong()
     private val dryRunSkipped = ConcurrentHashMap<String, AtomicLong>()
+    private val appliedWrites = ConcurrentHashMap<String, AtomicLong>()
+    private val rejectedWrites = ConcurrentHashMap<String, AtomicLong>()
+    private val acknowledgedPublishes = AtomicLong()
+    private val failedEffects = AtomicLong()
+    private val abandonedPublishes = AtomicLong()
+    private val lateRegistered = AtomicLong()
+    private val sourceSkipped = AtomicLong()
+    private val rawPages = AtomicLong()
+    private val rawRows = AtomicLong()
     private val warnings = CopyOnWriteArrayList<String>()
 
     fun incProcessed()                { processed.incrementAndGet() }
@@ -34,17 +42,46 @@ class ReportBuilder(
     fun incFailed()                   { failed.incrementAndGet() }
 
     /**
-     * Отказ ДОСТАВКИ, обнаруженный после того, как item уже засчитан успешным (async-publish в
-     * Kafka: `forEach` видит успех в момент отправки, брокер отвечает ошибкой позже). Отдельный
-     * счётчик, а не `failed`, чтобы не ломать тождество `processed = successful + skipped + failed`
-     * и при этом не прятать потерю сообщений.
+     * Строка источника отброшена при чтении (битый CSV) и до стадии не дошла.
+     *
+     * Отдельный счётчик, а не `skipped`: иначе ломается тождество
+     * `processed = successful + skipped + failed` — такая строка никогда не была `processed`.
      */
-    fun incAsyncFailed()              { asyncFailed.incrementAndGet() }
+    fun incSourceSkipped()            { sourceSkipped.incrementAndGet() }
 
-    /** Инкрементить счётчик dry-run-пропущенных write'ов по метке (используется внутри `guardWrite`). */
+    /**
+     * Инкрементить счётчик dry-run-пропущенных write'ов по метке (используется внутри `guardWrite`).
+     */
     fun incDryRunSkipped(label: String) {
         dryRunSkipped.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
     }
+
+    /** Запись применилась. */
+    fun incAppliedWrite(label: String) {
+        appliedWrites.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** Запись отклонена — ожидаемый отрицательный исход, а не сбой. */
+    fun incRejectedWrite(label: String) {
+        rejectedWrites.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
+    }
+
+    /** Итоги барьера scope'а: подтверждено, отказано, брошено по таймауту, зарегистрировано поздно. */
+    fun addBarrierOutcome(acked: Long, failed: Long, abandoned: Long, late: Long) {
+        acknowledgedPublishes.addAndGet(acked)
+        failedEffects.addAndGet(failed)
+        abandonedPublishes.addAndGet(abandoned)
+        lateRegistered.addAndGet(late)
+    }
+
+    /** Сырая страница пагинатора: единственное место, где видно «прочитано» до фильтров. */
+    fun addRawPage(rows: Int) {
+        rawPages.incrementAndGet()
+        rawRows.addAndGet(rows.toLong())
+    }
+
+    /** Число брошенных и поздно зарегистрированных эффектов — runner поднимает по ним exit-код. */
+    fun unconfirmedEffectsCount(): Long = abandonedPublishes.get() + lateRegistered.get()
 
     /** Добавить нефатальное предупреждение (например, исключение при закрытии ресурса). */
     fun addWarning(message: String)   { warnings.add(message) }
@@ -52,15 +89,12 @@ class ReportBuilder(
     /** Текущее значение `skipped` — для проверки `errorThreshold` по ходу прогона. */
     fun skippedCount(): Long = skipped.get()
 
-    /** Текущее число отказов async-доставки — runner использует для финального exit-кода. */
-    fun asyncFailedCount(): Long = asyncFailed.get()
-
     /** Текущее значение `processed` — runner использует для post-mortem проверок. */
     fun processedCount(): Long = processed.get()
 
     /**
      * `true`, если через `guardWrite` не прошло ни одной записи. Под dry-run это единственный
-     * наблюдаемый признак того, что скрипт пишет мимо гейта (забытый `mutation { }`).
+     * наблюдаемый признак того, что миграция пишет мимо гейта (забытый `write { }`).
      */
     fun noWritesGated(): Boolean = dryRunSkipped.isEmpty()
 
@@ -78,8 +112,16 @@ class ReportBuilder(
             successful = successful.get(),
             skipped = skipped.get(),
             failed = failed.get(),
-            asyncFailed = asyncFailed.get(),
             dryRunSkipped = dryRunSkipped.mapValues { it.value.get() },
+            appliedWrites = appliedWrites.mapValues { it.value.get() },
+            rejectedWrites = rejectedWrites.mapValues { it.value.get() },
+            acknowledgedPublishes = acknowledgedPublishes.get(),
+            failedEffects = failedEffects.get(),
+            abandonedPublishes = abandonedPublishes.get(),
+            lateRegistered = lateRegistered.get(),
+            sourceSkipped = sourceSkipped.get(),
+            rawPages = rawPages.get(),
+            rawRows = rawRows.get(),
             errorsFile = errorsFile,
             tracesFile = tracesFile,
             warnings = warnings.toList(),
