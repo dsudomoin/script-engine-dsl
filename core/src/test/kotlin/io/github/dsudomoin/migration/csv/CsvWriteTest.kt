@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.csv
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -16,7 +16,7 @@ class CsvWriteTest {
 
     @Test
     fun `openCsv - пишет header сразу и row дописывает`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
 
         with(ctx) {
@@ -32,7 +32,7 @@ class CsvWriteTest {
 
     @Test
     fun `openCsv - header виден до первого row`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
 
         with(ctx) { openCsv(out, "a", "b") }
@@ -43,7 +43,7 @@ class CsvWriteTest {
 
     @Test
     fun `dry-run - файл всё равно пишется`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
         val out = tmp.resolve("out.csv")
 
         with(ctx) {
@@ -58,7 +58,7 @@ class CsvWriteTest {
 
     @Test
     fun `openCsv - регистрируется и закрывается через closeRegistered`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
 
         val csv = with(ctx) { openCsv(out, "x") }
@@ -74,7 +74,7 @@ class CsvWriteTest {
 
     @Test
     fun `close идемпотентен - повторный вызов no-op`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
         val csv = with(ctx) { openCsv(out, "x") }
         csv.row(1)
@@ -88,7 +88,7 @@ class CsvWriteTest {
 
     @Test
     fun `row thread-safe под параллельной записью`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
         val csv = with(ctx) { openCsv(out, "thread", "n") }
 
@@ -132,7 +132,7 @@ class CsvWriteTest {
 
     @Test
     fun `openCsv(filename) - резолвится в ctx outputFolder`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test(outputFolder = tmp)
+        val ctx = RunContext.test(outputFolder = tmp)
 
         with(ctx) {
             val csv = openCsv("nested/sub/out.csv", "x", "y")
@@ -148,7 +148,7 @@ class CsvWriteTest {
 
     @Test
     fun `escape - запятые, кавычки и переводы строк квотируются`(@TempDir tmp: Path) {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val out = tmp.resolve("out.csv")
 
         with(ctx) {

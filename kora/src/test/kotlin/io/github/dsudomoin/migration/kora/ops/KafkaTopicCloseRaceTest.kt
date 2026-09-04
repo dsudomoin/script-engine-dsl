@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.apache.kafka.clients.producer.MockProducer
 import org.apache.kafka.common.serialization.StringSerializer
 import org.assertj.core.api.Assertions.assertThat
@@ -26,7 +26,7 @@ class KafkaTopicCloseRaceTest {
     @Test
     fun `close из N потоков — flush вызван ровно один раз`(@TempDir tmp: Path) {
         val producer = FlushCountingMockProducer()
-        val ctx = DefaultMigrationContext.test(outputFolder = tmp)
+        val ctx = RunContext.test(outputFolder = tmp)
         val t = with(ctx) { topic(producer, "test-topic") }
 
         val workers = 32
@@ -51,7 +51,7 @@ class KafkaTopicCloseRaceTest {
     @Test
     fun `close под dry-run — flush не вызывается ни разу`(@TempDir tmp: Path) {
         val producer = FlushCountingMockProducer()
-        val ctx = DefaultMigrationContext.test(dryRun = true, outputFolder = tmp)
+        val ctx = RunContext.test(dryRun = true, outputFolder = tmp)
         val t = with(ctx) { topic(producer, "test-topic") }
 
         t.close()

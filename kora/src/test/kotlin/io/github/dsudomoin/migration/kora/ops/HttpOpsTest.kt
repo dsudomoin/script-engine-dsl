@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
@@ -9,7 +9,7 @@ class HttpOpsTest {
 
     @Test
     fun `get выполняется и возвращает статус`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val calls = mutableListOf<String>()
         val stub: HttpCall = { m, p, _, _ -> calls += "$m $p"; 200 }
 
@@ -21,7 +21,7 @@ class HttpOpsTest {
 
     @Test
     fun `post под dry-run не вызывает client и возвращает 200`() {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
         var called = false
         val stub: HttpCall = { _, _, _, _ -> called = true; 201 }
 
@@ -36,7 +36,7 @@ class HttpOpsTest {
 
     @Test
     fun `post без dry-run вызывает client`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 204 }
 
         val status = with(ctx) { http(stub).post("/hooks", ByteArray(0)) }
@@ -46,7 +46,7 @@ class HttpOpsTest {
 
     @Test
     fun `HttpCall throws - исключение пробрасывается через post`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> throw java.net.SocketTimeoutException("timeout") }
 
         val ex = runCatching {
@@ -59,7 +59,7 @@ class HttpOpsTest {
 
     @Test
     fun `HttpCall throws - get тоже пробрасывает (нет dry-run gate)`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> error("network down") }
 
         val ex = runCatching {
@@ -72,7 +72,7 @@ class HttpOpsTest {
 
     @Test
     fun `patch put delete - все под dry-run`() {
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
         val stub: HttpCall = { _, _, _, _ -> 200 }
 
         with(ctx) {
@@ -94,7 +94,7 @@ class HttpOpsStatusTest {
 
     @Test
     fun `не-2xx поднимает HttpStatusException и не считается успехом`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 500 }
 
         val thrown = catchThrowable { with(ctx) { http(stub).post("/hooks") } }
@@ -108,7 +108,7 @@ class HttpOpsStatusTest {
 
     @Test
     fun `не-2xx на чтении тоже поднимает исключение`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 404 }
 
         assertThat(catchThrowable { with(ctx) { http(stub).get("/orders/42") } })
@@ -117,7 +117,7 @@ class HttpOpsStatusTest {
 
     @Test
     fun `2xx проходит`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 299 }
 
         assertThat(with(ctx) { http(stub).put("/orders/42") }).isEqualTo(299)

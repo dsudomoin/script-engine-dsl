@@ -1,17 +1,17 @@
 package io.github.dsudomoin.migration.csv
 
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 import java.io.BufferedWriter
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 
 /**
- * Handle для записи CSV-output'а. Создаётся через [openCsv]. Регистрируется в [MigrationContext]
- * как [AutoCloseable] — закрывается runner'ом после `migrate()`, в обратном порядке регистрации.
+ * Handle для записи CSV-output'а. Создаётся через [openCsv]. Регистрируется в [RunScope]
+ * как [AutoCloseable] — закрывается runner'ом после исполнения плана, в обратном порядке регистрации.
  *
  * Методы:
- * - [row] thread-safe (можно вызывать из параллельных `forEach`-воркеров).
+ * - [row] thread-safe (можно вызывать из параллельных воркеров стадии).
  * - [close] идемпотентный (повторный вызов — no-op).
  */
 interface CsvOutput : AutoCloseable {
@@ -21,7 +21,7 @@ interface CsvOutput : AutoCloseable {
      *
      * **Не делает flush** — буферизованные строки попадут на диск при [flush] или [close].
      * Это сознательный выбор: на 1M-row выгрузках per-row flush был бы узким местом
-     * (миллион syscall'ов). Runner закрывает все [CsvOutput] в `finally` после migrate() —
+     * (миллион syscall'ов). Runner закрывает все [CsvOutput] в `finally` после исполнения плана —
      * к этому моменту все строки гарантированно на диске. Если миграция жёстко падает
      * (kill -9, OOM до close), последние буферизованные строки теряются — для типичных
      * аналитических CSV это приемлемо.
@@ -80,7 +80,7 @@ private class CsvOutputImpl(
 
 /**
  * Открывает CSV-файл по абсолютному [path], пишет header сразу, возвращает [CsvOutput] handle.
- * Регистрирует его в [MigrationContext] — runner закроет в `finally`.
+ * Регистрирует его в [RunScope] — runner закроет в `finally`.
  *
  * Поведение:
  * - `mkdir -p` на parent-папку.
@@ -88,7 +88,7 @@ private class CsvOutputImpl(
  * - Под dry-run файл **всё равно создаётся** и пишется. Это решение спеки (см. v0.1.0 §4.1):
  *   `--dry-run` остаётся диагностическим артефактом.
  */
-fun MigrationContext.openCsv(path: Path, vararg headers: String): CsvOutput {
+fun RunScope.openCsv(path: Path, vararg headers: String): CsvOutput {
     Files.createDirectories(path.parent ?: Path.of("."))
     val w = Files.newBufferedWriter(path, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
     // Заголовки тоже квотируем по RFC 4180 — на случай, если кто-то передаст "Order ID, total"
@@ -102,11 +102,11 @@ fun MigrationContext.openCsv(path: Path, vararg headers: String): CsvOutput {
 }
 
 /**
- * Открывает CSV-файл с именем [filename] относительно [MigrationContext.outputFolder].
+ * Открывает CSV-файл с именем [filename] относительно [RunScope.outputFolder].
  * Самый частый случай — `openCsv("processed.csv", "id", "status")`.
  *
  * Поддерживает вложенные пути (`openCsv("nested/sub/out.csv", ...)`) — промежуточные каталоги
  * создадутся через `mkdir -p`.
  */
-fun MigrationContext.openCsv(filename: String, vararg headers: String): CsvOutput =
+fun RunScope.openCsv(filename: String, vararg headers: String): CsvOutput =
     openCsv(outputFolder.resolve(filename), *headers)

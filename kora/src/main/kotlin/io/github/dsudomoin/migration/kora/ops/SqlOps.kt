@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 import java.sql.Connection
 import java.sql.PreparedStatement
@@ -9,7 +9,7 @@ import java.sql.ResultSet
 /**
  * JDBC-операции миграции: `query/stream/execute/batch` поверх Kora [JdbcConnectionFactory].
  *
- * Создаётся через [jdbc] на [MigrationContext]. В двух режимах:
+ * Создаётся через [jdbc] на [RunScope]. В двух режимах:
  * - **Free** (вне [transactional]): каждый вызов `query/execute/batch` открывает свою
  *   транзакцию через `db.inTx`. Удобно для ad-hoc read'ов.
  * - **Tx-bound** (внутри [transactional]): все вызовы переиспользуют один [Connection],
@@ -18,14 +18,14 @@ import java.sql.ResultSet
  * Write-операции (`execute`, `batch`) идут через `guardWrite` — под dry-run пропускаются.
  */
 class SqlOps internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val db: JdbcConnectionFactory,
     private val txConn: Connection?,
     internal val inTx: Boolean,
 ) {
     /**
      * Поток, открывший транзакцию. `java.sql.Connection` не потокобезопасен, а
-     * `transactional { forEach(items, parallel = 4) { execute(...) } }` компилируется и выглядит
+     * `transactional { }` вокруг параллельной стадии компилируется и выглядит
      * безобидно: четыре воркера начинают готовить statement'ы на одном соединении. ThreadLocal-
      * guard `txInProgress` этот случай не ловит принципиально — воркеры сидят на других потоках,
      * поэтому владельца запоминаем явно.
@@ -82,7 +82,7 @@ class SqlOps internal constructor(
      *     fetchSize = 5000,
      *     mapper = { it.getLong("id") },
      * ) { rows ->
-     *     forEach(rows, parallel = 4, onError = OnError.Skip) { id -> ... }
+     *     // обрабатываем строки внутри одной транзакции, последовательно
      * }
      *
      * // 2. Возврат значения наружу: фолдим в R прямо внутри consume
@@ -237,8 +237,8 @@ class SqlOps internal constructor(
             check(Thread.currentThread() === txOwner) {
                 "tx-bound jdbc ops used from thread '${Thread.currentThread().name}', but the " +
                     "transaction belongs to '${txOwner?.name}'. java.sql.Connection is not thread-safe: " +
-                    "do not run a parallel forEach inside transactional { } — put transactional { } " +
-                    "inside the forEach body instead."
+                    "do not run a parallel stage inside transactional { } — put transactional { } " +
+                    "inside the handler body instead."
             }
             block(txConn)
         } else {
@@ -479,7 +479,7 @@ class SqlOps internal constructor(
  * transactional(jdbc(db)) { execute("..."); execute("...") }
  * ```
  */
-fun MigrationContext.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, txConn = null, inTx = false)
+fun RunScope.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, txConn = null, inTx = false)
 
 /**
  * Реальный транзакционный scope. Открывает один [Connection] через `db.inTx`, создаёт
@@ -491,7 +491,7 @@ fun MigrationContext.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, 
  *
  * @throws IllegalStateException если [ops] уже находится внутри активной транзакции.
  */
-fun <R> MigrationContext.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
+fun <R> RunScope.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
     if (ops.inTx) throw IllegalStateException("nested transactional not supported (already in tx-bound SqlOps)")
     // Доп. guard: пользователь мог передать **внешний** free-mode `ops` внутри уже открытого
     // `transactional` — тогда `ops.inTx == false`, но Kora уже держит открытую tx на текущем

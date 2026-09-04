@@ -2,19 +2,19 @@ package io.github.dsudomoin.migration.error
 
 /**
  * Контракт авто-аудитора item-уровневых ошибок. Дефолтная реализация — [CsvFileErrorReporter]
- * (пишет в `errors.csv` + `errors.log` под [io.github.dsudomoin.migration.MigrationContext.outputFolder]).
+ * (пишет в `errors.csv` + `errors.log` под [io.github.dsudomoin.migration.RunScope.outputFolder]).
  *
  * Пользователь может подменить дефолт своей реализацией для интеграции с Sentry, Kibana,
  * JSON Lines, и т.д. — для этого пишет свой `ErrorReporter` и подключает через кастомный
  * `internalCreate` (см. `customization.md`).
  *
  * Реализации должны быть thread-safe: [report] и [registerSerializer] могут вызываться из
- * параллельных воркеров `forEach`.
+ * параллельных воркеров стадии.
  */
 interface ErrorReporter : AutoCloseable {
     /**
-     * Записать ошибку. Уже вызывается автоматически из `forEach`-движка через
-     * [io.github.dsudomoin.migration.MigrationContext.auditError]. Пользовательский прямой вызов нужен только
+     * Записать ошибку. Уже вызывается автоматически интерпретатором плана через
+     * [io.github.dsudomoin.migration.RunScope.auditError]. Пользовательский прямой вызов нужен только
      * для ad-hoc отчётности.
      */
     fun report(e: Throwable, item: Any?)
@@ -30,7 +30,7 @@ interface ErrorReporter : AutoCloseable {
 
 /**
  * Регистрация сериализатора по типу [T]. Эквивалент `registerSerializer(T::class.java) { f(it as T) }`.
- * Идиоматический вызов из `migrate()`:
+ * Идиоматический вызов из `items { }` при сборке источника:
  * ```
  * errors.includeItem<Customer> { "id=${it.id}, status=${it.status}" }
  * ```

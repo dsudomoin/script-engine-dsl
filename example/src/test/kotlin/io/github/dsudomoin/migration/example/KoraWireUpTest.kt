@@ -1,14 +1,13 @@
 package io.github.dsudomoin.migration.example
 
-import io.github.dsudomoin.migration.Migration
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.forEach
+import io.github.dsudomoin.migration.MigrationDefinition
+import io.github.dsudomoin.migration.WriteOutcome
 import io.github.dsudomoin.migration.kora.DefaultsValues
 import io.github.dsudomoin.migration.kora.MigrationConfig
 import io.github.dsudomoin.migration.kora.MigrationConfigValues
 import io.github.dsudomoin.migration.kora.MigrationExit
 import io.github.dsudomoin.migration.kora.MigrationModule
-import io.github.dsudomoin.migration.mutation
+import io.github.dsudomoin.migration.migration
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -72,41 +71,55 @@ class TestExit : MigrationExit {
 }
 
 @Component
-class ParallelProbeMigration : Migration(name = "WIRE-UP-PARALLEL", author = "test") {
-    override fun MigrationContext.migrate() {
-        Probe.sawDryRun = dryRun
+class ParallelProbeMigration : MigrationDefinition {
+    override val name = "WIRE-UP-PARALLEL"
 
+    override fun plan() = migration(name = name, author = "test") {
         // Барьер на четырёх участников — жёсткая проверка настоящего параллелизма. На пуле
-        // фиксированного размера в один поток (как было до перехода на cached pool) он не
-        // соберётся и тест упадёт по таймауту. Тихая деградация «работает, просто в один поток»
-        // здесь недопустима — именно так и жил неработающий parallel.
+        // фиксированного размера в один поток он не соберётся и тест упадёт по таймауту. Тихая
+        // деградация «работает, просто в один поток» здесь недопустима.
         val barrier = CyclicBarrier(4)
-        forEach((1..4).toList(), parallel = 4) { n ->
+
+        source(
+            parallel = 4,
+            items = {
+                Probe.sawDryRun = dryRun
+                (1..4).asSequence()
+            },
+        ) { n ->
             Probe.workerThreads.add(Thread.currentThread().name)
             barrier.await(20, TimeUnit.SECONDS)
             Probe.parallelismReached = true
-            mutation("probe.write", args = mapOf("n" to n)) { Probe.written.add(n) }
-        }
-    }
-}
-
-/** Вложенный параллельный цикл: на общем пуле фиксированного размера это вечный вис. */
-@Component
-class NestedProbeMigration : Migration(name = "WIRE-UP-NESTED", author = "test") {
-    override fun MigrationContext.migrate() {
-        forEach(listOf("a", "b"), parallel = 2) { outer ->
-            forEach((1..2).toList(), parallel = 2) { inner ->
-                Probe.nestedSeen.add("$outer$inner")
+            write("probe.write", args = mapOf("n" to n)) {
+                Probe.written.add(n)
+                WriteOutcome.Applied
             }
         }
     }
 }
 
-/** Пишет мимо `mutation { }` — под dry-run запись уходит в бой, и отчёт обязан это заметить. */
+/** Две параллельные стадии подряд: пул обязан выдержать обе, не залипнув между ними. */
 @Component
-class UngatedProbeMigration : Migration(name = "WIRE-UP-UNGATED", author = "test") {
-    override fun MigrationContext.migrate() {
-        forEach((1..3).toList()) { n -> Probe.written.add(n) }
+class NestedProbeMigration : MigrationDefinition {
+    override val name = "WIRE-UP-NESTED"
+
+    override fun plan() = migration(name = name, author = "test") {
+        source(name = "outer", parallel = 2, items = { sequenceOf("a", "b") }) { outer ->
+            Probe.nestedSeen.add("${outer}1")
+        }
+        source(name = "inner", parallel = 2, items = { sequenceOf("a", "b") }) { outer ->
+            Probe.nestedSeen.add("${outer}2")
+        }
+    }
+}
+
+/** Пишет мимо `write { }` — под dry-run запись уходит в бой, и отчёт обязан это заметить. */
+@Component
+class UngatedProbeMigration : MigrationDefinition {
+    override val name = "WIRE-UP-UNGATED"
+
+    override fun plan() = migration(name = name, author = "test") {
+        source(items = { (1..3).asSequence() }) { n -> Probe.written.add(n) }
     }
 }
 
@@ -124,7 +137,7 @@ class KoraWireUpTest {
             .describedAs("runner обязан отработать при сборке графа и вернуть код возврата")
             .isEqualTo(0)
         assertThat(Probe.written)
-            .describedAs("тело migrate() должно выполниться целиком")
+            .describedAs("план должен выполниться целиком")
             .containsExactlyInAnyOrder(1, 2, 3, 4)
         assertThat(Probe.sawDryRun)
             .describedAs("migration.dryRun из конфига доезжает до контекста")
@@ -133,7 +146,7 @@ class KoraWireUpTest {
 
     @Test
     @Timeout(60)
-    fun `forEach с parallel = 4 действительно занимает четыре потока`(@TempDir tmp: Path) {
+    fun `source с parallel = 4 действительно занимает четыре потока`(@TempDir tmp: Path) {
         runGraph(MigrationConfigValues(run = "WIRE-UP-PARALLEL", outputFolder = tmp.toString()))
 
         assertThat(Probe.parallelismReached)
@@ -146,7 +159,7 @@ class KoraWireUpTest {
 
     @Test
     @Timeout(60)
-    fun `вложенный параллельный forEach не встаёт в deadlock`(@TempDir tmp: Path) {
+    fun `две параллельные стадии подряд не встают в deadlock`(@TempDir tmp: Path) {
         runGraph(MigrationConfigValues(run = "WIRE-UP-NESTED", outputFolder = tmp.toString()))
 
         assertThat(Probe.exitCode).isEqualTo(0)
@@ -173,12 +186,12 @@ class KoraWireUpTest {
         runGraph(MigrationConfigValues(run = "WIRE-UP-UNGATED", dryRun = true, outputFolder = tmp.toString()))
 
         assertThat(Probe.written)
-            .describedAs("запись мимо mutation { } под dry-run выполняется по-настоящему — это и есть ловушка")
+            .describedAs("запись мимо write { } под dry-run выполняется по-настоящему — это и есть ловушка")
             .containsExactlyInAnyOrder(1, 2, 3)
 
         val log = tmp.resolve("migration.log").toFile().readText()
         assertThat(log)
-            .describedAs("единственный наблюдаемый признак забытого mutation { } должен быть громким")
+            .describedAs("единственный наблюдаемый признак забытого write { } должен быть громким")
             .contains("intercepted 0 writes")
     }
 

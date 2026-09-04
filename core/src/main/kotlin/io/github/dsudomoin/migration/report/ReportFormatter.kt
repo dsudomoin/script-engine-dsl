@@ -33,10 +33,43 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
         val dr = if (asciiOnly) "[--]" else "⌀"
         val warn = if (asciiOnly) "[!]" else "⚠"
 
-        // Печатаем строку только когда отказы есть: в норме её быть не должно, и постоянная
-        // нулевая строка приучила бы глаз её пропускать.
-        val asyncLine = if (r.asyncFailed > 0) {
-            "  $fl Async delivery failed:  ${fmt(r.asyncFailed)}\n"
+        // Каждая строка ниже печатается только когда ей есть что показать: постоянные нулевые
+        // строки приучили бы глаз их пропускать.
+        fun breakdown(m: Map<String, Long>): String =
+            // Сортировка по метке даёт детерминированный порядок run-to-run: копится всё в
+            // ConcurrentHashMap, iteration order у которого нестабилен.
+            m.entries.sortedBy { it.key }.joinToString(", ") { "${it.key}: ${it.value}" }
+
+        val appliedLine = if (r.appliedWrites.isNotEmpty()) {
+            "  $ok Applied writes:          ${fmt(r.appliedWrites.values.sum())}  (${breakdown(r.appliedWrites)})\n"
+        } else ""
+
+        val rejectedLine = if (r.rejectedWrites.isNotEmpty()) {
+            "  $sk Rejected writes:         ${fmt(r.rejectedWrites.values.sum())}  (${breakdown(r.rejectedWrites)})\n"
+        } else ""
+
+        val ackedLine = if (r.acknowledgedPublishes > 0) {
+            "  $ok Acknowledged publishes:  ${fmt(r.acknowledgedPublishes)}\n"
+        } else ""
+
+        val failedEffectsLine = if (r.failedEffects > 0) {
+            "  $fl Failed effects:          ${fmt(r.failedEffects)}\n"
+        } else ""
+
+        // Отправлено, но не подтверждено: по таймауту барьера либо зарегистрировано после него.
+        // Это не «успех» и не «отказ» — исход неизвестен, и молча исчезать он не имеет права.
+        val unconfirmed = r.abandonedPublishes + r.lateRegistered
+        val unconfirmedLine = if (unconfirmed > 0) {
+            "  $warn Unconfirmed effects:     ${fmt(unconfirmed)}" +
+                "  (abandoned: ${r.abandonedPublishes}, late: ${r.lateRegistered})\n"
+        } else ""
+
+        val sourceSkippedLine = if (r.sourceSkipped > 0) {
+            "  $sk Source rows dropped:     ${fmt(r.sourceSkipped)}\n"
+        } else ""
+
+        val rawLine = if (r.rawPages > 0) {
+            "  $dr Source pages read:       ${fmt(r.rawPages)}  (rows: ${fmt(r.rawRows)})\n"
         } else ""
 
         val warningsBlock = if (r.warnings.isNotEmpty()) {
@@ -66,7 +99,13 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
             append("  $ok Successful:            ${fmt(r.successful)}\n")
             append("  $sk Skipped (errors):      ${fmt(r.skipped)}\n")
             append("  $fl Failed:                ${fmt(r.failed)}\n")
-            append(asyncLine)
+            append(appliedLine)
+            append(rejectedLine)
+            append(ackedLine)
+            append(failedEffectsLine)
+            append(unconfirmedLine)
+            append(sourceSkippedLine)
+            append(rawLine)
             append(warningsBlock)
             append(dryLine)
             append("$mid\n")

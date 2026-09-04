@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora
 
-import io.github.dsudomoin.migration.Migration
+import io.github.dsudomoin.migration.MigrationDefinition
 import ru.tinkoff.kora.application.graph.All
 import ru.tinkoff.kora.common.Module
 import ru.tinkoff.kora.common.Tag
@@ -15,7 +15,7 @@ import java.util.concurrent.Executor
  * `@KoraApp interface App : ..., MigrationModule` — и этого достаточно: секцию `migration`
  * модуль читает сам.
  *
- * Runner забирает все [Migration]-компоненты графа через `All<Migration>` (т.е. достаточно
+ * Runner забирает все [Migration]-компоненты графа через `All<MigrationDefinition>` (т.е. достаточно
  * пометить пользовательский скрипт `@Component`). Опционально подхватывает кастомный `Executor`,
  * помеченный `@Tag(MigrationExecutor::class)` — иначе создаёт свой cached pool.
  */
@@ -44,12 +44,12 @@ interface MigrationModule {
     @Root
     fun migrationRunner(
         config: MigrationConfig,
-        migrations: All<Migration>,
+        definitions: All<MigrationDefinition>,
         @Tag(MigrationExecutor::class) executor: Optional<Executor>,
         exit: Optional<MigrationExit>,
     ): MigrationRunner {
         val handler = exit.orElse(null)
-        val list = migrations.toList()
+        val list = definitions.toList()
         val pool = executor.orElse(null)
         // Без компонента [MigrationExit] runner завершает процесс сам — это штатный режим
         // одноразового скрипта. С компонентом код возврата уезжает в него: так граф можно

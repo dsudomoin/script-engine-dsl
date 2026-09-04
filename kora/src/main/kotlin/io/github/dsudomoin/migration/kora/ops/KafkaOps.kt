@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 import org.apache.kafka.clients.producer.Producer
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.clients.producer.RecordMetadata
@@ -12,16 +12,16 @@ import java.util.concurrent.atomic.AtomicLong
  * Ad-hoc Kafka-publish операции. Используется когда нужно publish'ить в разные топики из одного
  * скрипта без заведения [KafkaTopic]-handle на каждый.
  *
- * Инстанс — один на `Producer` в пределах прогона (см. [MigrationContext.shared]), поэтому
- * `kafka(producer)` можно спокойно вызывать прямо в теле `forEach`. Регистрируется в контексте:
- * runner закроет его после `migrate()`, и закрытие делает `flush()` — без этого callback'и
+ * Инстанс — один на `Producer` в пределах прогона (см. [RunScope.shared]), поэтому
+ * `kafka(producer)` можно спокойно вызывать прямо в обработчике. Регистрируется в контексте:
+ * runner закроет его после исполнения плана, и закрытие делает `flush()` — без этого callback'и
  * async-отправок могли бы не успеть отработать до печати отчёта.
  *
  * Для типичного «один топик на миграцию» — предпочитай [topic] (`val t = topic(producer, name)`,
  * потом `t.send(key, value)`).
  */
 class KafkaOps<K, V> internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val producer: Producer<K, V>,
 ) : AutoCloseable {
 
@@ -33,7 +33,7 @@ class KafkaOps<K, V> internal constructor(
 
     /**
      * Sync-publish. Блокируется до ack от брокера, ошибка доставки летит наружу и штатно доходит
-     * до `OnError` и `errors.csv`. Под dry-run — `null`, в лог
+     * до политики ошибок стадии и `errors.csv`. Под dry-run — `null`, в лог
      * `INFO [DRY-RUN] kafka.publish (topic=..., key=...)`.
      */
     fun publish(topic: String, key: K, value: V): PublishResult? =
@@ -50,10 +50,9 @@ class KafkaOps<K, V> internal constructor(
      * Async-publish. Возвращает `CompletableFuture` — не блокируется на ack. Под dry-run —
      * completed future со значением `null`, реальный `producer.send` не вызывается.
      *
-     * **Про учёт.** `forEach` засчитывает item успешным в момент отправки, а брокер отвечает
+     * **Про учёт.** Обработчик засчитывает item в момент отправки, а брокер отвечает
      * позже — и возвращаемый future в реальных скриптах почти никто не читает. Поэтому отказ
      * доставки обрабатывается здесь же, в callback'е: строка уходит в `errors.csv`, счётчик
-     * `report.asyncFailed` растёт, а runner по нему поднимает exit-код до 1. Иначе отчёт
      * показывал бы «successful: 1 000 000» при молча потерянных сообщениях.
      */
     fun publishAsync(topic: String, key: K, value: V): CompletableFuture<PublishResult?> =
@@ -66,14 +65,6 @@ class KafkaOps<K, V> internal constructor(
             producer.send(ProducerRecord(topic, key, value)) { md, err ->
                 if (err != null) {
                     asyncFailures.incrementAndGet()
-                    ctx.report.incAsyncFailed()
-                    // Аудит идёт из IO-потока продюсера: если сам аудитор упал (диск кончился),
-                    // терять исходную ошибку доставки нельзя — она уже учтена счётчиком выше.
-                    try {
-                        ctx.auditError(err, key)
-                    } catch (auditErr: Throwable) {
-                        ctx.log.warn("auditError failed for failed kafka delivery key=$key", auditErr)
-                    }
                     cf.completeExceptionally(err)
                 } else {
                     cf.complete(PublishResult(md.topic(), md.partition(), md.offset()))
@@ -95,7 +86,7 @@ class KafkaOps<K, V> internal constructor(
         val failed = asyncFailures.get()
         if (failed > 0) {
             ctx.report.addWarning(
-                "kafka.publishAsync: $failed message(s) were rejected by the broker; see errors.csv",
+                "kafka.publishAsync: $failed message(s) were rejected by the broker; see the report",
             )
         }
     }
@@ -105,9 +96,9 @@ class KafkaOps<K, V> internal constructor(
 
 /**
  * Фабрика [KafkaOps] — для ad-hoc публикаций без `topic`-handle. Инстанс мемоизируется на
- * `Producer` в пределах прогона, поэтому вызов внутри `forEach` не плодит объекты.
+ * `Producer` в пределах прогона, поэтому вызов внутри обработчика не плодит объекты.
  */
-fun <K, V> MigrationContext.kafka(producer: Producer<K, V>): KafkaOps<K, V> =
+fun <K, V> RunScope.kafka(producer: Producer<K, V>): KafkaOps<K, V> =
     shared(producer) { KafkaOps(this, producer) }
 
 /**
@@ -118,7 +109,7 @@ fun <K, V> MigrationContext.kafka(producer: Producer<K, V>): KafkaOps<K, V> =
  * Типичная схема:
  * ```
  * val resync = topic(producer, "customers.resync")
- * forEach(items) { item -> resync.send(item.id, item.toEvent()) }
+ * source(items = { ... }) { item -> publish("resync") { resync.sendAsync(item.id, item.toEvent()) } }
  * // flush на закрытии runner'ом
  * ```
  */
@@ -132,7 +123,7 @@ class KafkaTopic<K, V> internal constructor(
 
     /**
      * Async-publish в забинженный топик. Отказ доставки учитывается так же, как в
-     * [KafkaOps.publishAsync] — попадает в `errors.csv` и в `report.asyncFailed`.
+     * [KafkaOps.publishAsync] — учитывается барьером стадии, если future отдан в `publish { }`.
      */
     fun sendAsync(key: K, value: V): CompletableFuture<KafkaOps.PublishResult?> = ops.publishAsync(name, key, value)
 
@@ -146,10 +137,10 @@ class KafkaTopic<K, V> internal constructor(
 
 /**
  * Фабрика [KafkaTopic]. Хендл мемоизируется на пару (`producer`, `name`) и регистрируется в
- * контексте — runner закроет (с flush'ем) после `migrate()`. Повторный вызов с теми же
- * аргументами (в том числе прямо в теле `forEach`) отдаёт тот же объект.
+ * контексте — runner закроет (с flush'ем) после исполнения плана. Повторный вызов с теми же
+ * аргументами (в том числе прямо в обработчике) отдаёт тот же объект.
  */
-fun <K, V> MigrationContext.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V> =
+fun <K, V> RunScope.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V> =
     shared(TopicKey(producer, name)) { KafkaTopic(kafka(producer), name) }
 
 /** Ключ мемоизации [topic]: идентичность продюсера плюс имя топика. */

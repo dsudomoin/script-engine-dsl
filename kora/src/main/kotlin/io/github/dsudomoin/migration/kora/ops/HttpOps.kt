@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.MigrationContext
+import io.github.dsudomoin.migration.RunScope
 
 /**
  * Минимальный функциональный контракт для HTTP-вызова. Намеренно untyped — позволяет адаптировать
@@ -12,12 +12,12 @@ typealias HttpCall = (method: String, path: String, body: ByteArray?, headers: M
 
 /**
  * Внешний сервис ответил кодом вне диапазона 2xx. Бросается всеми методами [HttpOps], чтобы
- * неуспешный вызов доходил до `OnError` и до `errors.csv`, а не засчитывался как успешный item.
+ * неуспешный вызов доходил до политики ошибок стадии и до `errors.csv`, а не засчитывался как успешный.
  *
- * Ловится в `OnError.handle { e, item -> ... }` для политики по коду ответа:
+ * Ловится в `ItemError.Handle { e, item -> ... }` для политики по коду ответа:
  * ```
- * onError = OnError.handle { e, _ ->
- *     if (e is HttpStatusException && e.status == 409) OnError.Decision.Skip else OnError.Decision.Fail
+ * onItemError = ItemError.Handle { e, _: Order ->
+ *     if (e is HttpStatusException && e.status == 409) ItemError.Decision.Skip else ItemError.Decision.Fail
  * }
  * ```
  */
@@ -38,11 +38,11 @@ class HttpStatusException(
  * этого мёртвый бэкенд, отвечающий 500 на каждый запрос, давал бы отчёт «100 000 successful»
  * при нулевом эффекте бэкфилла.
  *
- * Для типизированного Kora `@HttpClient` — оборачивай write-вызов в `mutation("label") { ... }`,
+ * Для типизированного Kora `@HttpClient` — оборачивай write-вызов в `write("label") { ... }`,
  * а read-вызов делай напрямую без обёртки.
  */
 class HttpOps internal constructor(
-    private val ctx: MigrationContext,
+    private val ctx: RunScope,
     private val call: HttpCall,
 ) {
     /** GET — read-only, без dry-run gate. Не-2xx поднимает [HttpStatusException]. */
@@ -94,4 +94,4 @@ class HttpOps internal constructor(
  * Фабрика [HttpOps]. [call] — твой адаптер: функция, которая знает как выполнить запрос
  * через конкретный HTTP-клиент.
  */
-fun MigrationContext.http(call: HttpCall): HttpOps = HttpOps(this, call)
+fun RunScope.http(call: HttpCall): HttpOps = HttpOps(this, call)

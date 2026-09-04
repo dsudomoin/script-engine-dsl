@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -47,7 +47,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `query читает строки`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ids = with(ctx) {
             jdbc(db).query("select id from orders where status = :s", "s" to 1) { it.getLong("id") }
         }
@@ -56,10 +56,10 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `execute под dry-run не меняет БД`() {
-        val dryCtx = DefaultMigrationContext.test(dryRun = true)
+        val dryCtx = RunContext.test(dryRun = true)
         with(dryCtx) { jdbc(db).execute("update orders set status = 99") }
 
-        val realCtx = DefaultMigrationContext.test(dryRun = false)
+        val realCtx = RunContext.test(dryRun = false)
         val count = with(realCtx) {
             jdbc(db).query("select count(*) as c from orders where status = 99") { it.getInt("c") }
         }.first()
@@ -68,7 +68,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `validate - missing parameter бросает IllegalArgumentException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).query("select id from orders where status = :s") { it.getLong("id") }
@@ -80,7 +80,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `validate - extra parameter бросает IllegalArgumentException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).query("select id from orders", "extra" to 1) { it.getLong("id") }
@@ -92,7 +92,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `validate - duplicate keys бросают IllegalArgumentException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).query("select id from orders where status = :s", "s" to 1, "s" to 2) { it.getLong("id") }
@@ -104,7 +104,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `parseSql - colon name внутри строки не парсится как параметр`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val result = with(ctx) {
             jdbc(db).query("select ':fake' as v") { it.getString("v") }
         }
@@ -113,7 +113,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `parseSql - colon name внутри block comment не парсится как параметр`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         // `:fake` спрятан внутри /* ... */ — не должен попасть в список named-params,
         // SQL валиден, query выполняется без ошибки про missing parameter.
         val result = with(ctx) {
@@ -124,7 +124,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `parseSql - colon name внутри dollar-quoted строки не парсится`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         // `:fake` спрятан внутри $$...$$ — PostgreSQL читает как литерал, наш парсер тоже.
         val result = with(ctx) {
             jdbc(db).query("select \$\$:fake\$\$ as v") { it.getString("v") }
@@ -134,7 +134,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `parseSql - colon name внутри tagged dollar-quoted строки не парсится`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         // `$body$:fake$body$` — tagged variant, тоже не должен зацепиться.
         val result = with(ctx) {
             jdbc(db).query("select \$body\$:fake\$body\$ as v") { it.getString("v") }
@@ -144,7 +144,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `parseSql - block comment не мешает реальному named-параметру вне него`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         // /* :fake */ комментарий, а :s — настоящий параметр.
         val result = with(ctx) {
             jdbc(db).query(
@@ -157,7 +157,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `transactional - оба execute коммитятся при успешном выходе`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         with(ctx) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 50)
@@ -172,7 +172,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `transactional - rollback при throw, ни одной строки`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         try {
             with(ctx) {
                 transactional(jdbc(db)) {
@@ -191,7 +191,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `transactional - query внутри tx видит свои uncommitted inserts`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val visible = with(ctx) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 70)
@@ -203,7 +203,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `nested transactional - бросает IllegalStateException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ops = with(ctx) { jdbc(db) }
         try {
             with(ctx) {
@@ -228,7 +228,7 @@ class SqlOpsIntegrationTest {
         // Тонкий escape hatch: пользователь сохраняет ссылку на free-mode `ops` (inTx == false)
         // и вызывает `transactional(ops)` ПОВТОРНО изнутри уже открытой tx. Без ThreadLocal-guard'а
         // в SqlOps это открывало бы вторую независимую tx — нарушение «nested не поддерживается».
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val outerOps = with(ctx) { jdbc(db) }                   // inTx == false
         try {
             with(ctx) {
@@ -255,7 +255,7 @@ class SqlOpsIntegrationTest {
     fun `последовательные transactional на одном потоке не блокируют друг друга`() {
         // Sanity: ThreadLocal-флаг должен сбрасываться по выходу из transactional, иначе второй
         // (не вложенный, а *последующий*) `transactional` упал бы false-positive'ом.
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         with(ctx) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 82)
@@ -272,7 +272,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `transactional под dry-run - execute не пишет, реальный tx не открывается`() {
-        val dryCtx = DefaultMigrationContext.test(dryRun = true)
+        val dryCtx = RunContext.test(dryRun = true)
         with(dryCtx) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 91)
@@ -282,7 +282,7 @@ class SqlOpsIntegrationTest {
             }
         }
         // 1) Ни одна строка не записана
-        val realCtx = DefaultMigrationContext.test()
+        val realCtx = RunContext.test()
         val count = with(realCtx) {
             jdbc(db).query("select count(*) as c from orders where status in (91, 92)") { it.getInt("c") }
         }.first()
@@ -294,7 +294,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `batch update меняет множество строк`() {
-        val ctx = DefaultMigrationContext.test(dryRun = false)
+        val ctx = RunContext.test(dryRun = false)
         val ids = with(ctx) {
             jdbc(db).query("select id from orders") { it.getLong("id") }
         }
@@ -311,7 +311,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream проходит по всем строкам с fetchSize меньше total`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ids = mutableListOf<Long>()
         with(ctx) {
             jdbc(db).stream(
@@ -325,7 +325,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream возвращает значение из consume callback`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val sum = with(ctx) {
             jdbc(db).stream(
                 "select id from orders",
@@ -338,7 +338,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream с named-параметрами фильтрует и валидирует placeholders`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ids = with(ctx) {
             jdbc(db).stream(
                 "select id from orders where status = :s",
@@ -351,7 +351,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream - missing parameter бросает IllegalArgumentException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).stream(
@@ -366,7 +366,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream - fetchSize не положительный бросает IllegalArgumentException`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).stream(
@@ -382,7 +382,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream - exception в consume пробрасывается и connection корректно освобождается`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 jdbc(db).stream(
@@ -406,7 +406,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream внутри transactional видит uncommitted insert`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val visible = with(ctx) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 88)
@@ -420,7 +420,7 @@ class SqlOpsIntegrationTest {
 
     @Test
     fun `stream - sequence невалидна после возврата из consume`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val leaked: Sequence<Long> = with(ctx) {
             jdbc(db).stream(
                 "select id from orders",

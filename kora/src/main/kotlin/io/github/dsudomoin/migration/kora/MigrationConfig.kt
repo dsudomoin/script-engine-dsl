@@ -24,7 +24,7 @@ import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor
 @ConfigValueExtractor
 interface MigrationConfig {
 
-    /** Имя миграции к запуску (совпадает с [io.github.dsudomoin.migration.Migration.name]). `null` = idle. */
+    /** Имя миграции к запуску (совпадает с [io.github.dsudomoin.migration.MigrationDefinition.name]). `null` = idle. */
     fun run(): String?
 
     /** `true` — все write'ы через `guardWrite` пропускаются, в отчёт идёт breakdown. */
@@ -39,7 +39,7 @@ interface MigrationConfig {
      */
     fun outputFolder(): String?
 
-    /** Дефолты для `forEach`, порога ошибок и unhandled-policy. */
+    /** Дефолты для стадий, порога ошибок и unhandled-policy. */
     fun defaults(): Defaults
 
     /** Тонкая настройка авто-аудитора. Пути файлов выводятся из [outputFolder]. */
@@ -52,7 +52,7 @@ interface MigrationConfig {
     @ConfigValueExtractor
     interface Defaults {
 
-        /** Политика для `migrate()`-level исключений (см. [ScriptPolicy]). */
+        /** Политика для исключений, вышедших за пределы стадий (см. [ScriptPolicy]). */
         fun onUnhandled(): ScriptPolicy = ScriptPolicy.FAIL_FAST
 
         /** Если `skipped > threshold` — прервать прогон с exit 1. `0` = отключено. */
@@ -62,7 +62,7 @@ interface MigrationConfig {
         fun progressEvery(): Int = 1000
 
         /**
-         * Значение аргумента `parallel` у `forEach`, если он не указан явно. Реальный
+         * Значение аргумента `parallel` у стадии, если он не указан явно. Реальный
          * параллелизм каждого цикла задаёт его собственный аргумент; пул runner'а cached и
          * подстраивается под запрошенное число воркеров.
          */

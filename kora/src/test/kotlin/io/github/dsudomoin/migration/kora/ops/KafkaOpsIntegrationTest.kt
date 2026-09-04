@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.KafkaProducer
@@ -45,7 +45,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `publish - сообщение доходит до топика`() {
         val topic = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
 
         with(ctx) { kafka(producer).publish(topic, "k1", "v1") }
 
@@ -56,7 +56,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `publish под dry-run - ничего не отправляется`() {
         val topic = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
 
         with(ctx) { kafka(producer).publish(topic, "k-dry", "v-dry") }
 
@@ -67,7 +67,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `topic - отправляет в указанный топик`() {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
 
         with(ctx) {
             val t = topic(producer, topicName)
@@ -82,7 +82,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `topic - все три send долетают, close дёргает flush`() {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
 
         with(ctx) {
             val t = topic(producer, topicName)
@@ -99,7 +99,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `topic под dry-run - send не доходит до брокера`() {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test(dryRun = true)
+        val ctx = RunContext.test(dryRun = true)
 
         with(ctx) {
             val t = topic(producer, topicName)
@@ -114,7 +114,7 @@ class KafkaOpsIntegrationTest {
     @Test
     fun `topic - close идемпотентен`() {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val t = with(ctx) { topic(producer, topicName) }
         t.send("k1", "v1")
 

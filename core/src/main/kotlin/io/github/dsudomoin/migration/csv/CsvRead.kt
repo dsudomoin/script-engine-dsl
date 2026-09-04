@@ -2,9 +2,8 @@ package io.github.dsudomoin.migration.csv
 
 import com.fasterxml.jackson.dataformat.csv.CsvMapper
 import com.fasterxml.jackson.dataformat.csv.CsvSchema
-import io.github.dsudomoin.migration.MigrationContext
-import io.github.dsudomoin.migration.OnError
-import io.github.dsudomoin.migration.internal.ErrorThresholdExceeded
+import io.github.dsudomoin.migration.RunScope
+import io.github.dsudomoin.migration.ItemError
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -21,10 +20,10 @@ import java.nio.file.Path
  * @param onRowError что делать со строкой, которую не удалось разобрать или отобразить в `T`.
  *                   См. [readCsv] KDoc про политики.
  */
-fun <T> MigrationContext.readCsv(
+fun <T> RunScope.readCsv(
     path: String,
     classpath: Boolean = false,
-    onRowError: OnError = OnError.Fail,
+    onRowError: ItemError<Map<String, String>> = ItemError.Fail,
     mapper: (Map<String, String>) -> T,
 ): Sequence<T> = lazyCsvSequence(onRowError, mapper) {
     if (classpath) {
@@ -38,10 +37,10 @@ fun <T> MigrationContext.readCsv(
     }
 }
 
-/** Перегрузка с явным [Path] — для случаев, когда path уже посчитан (например, относительно [MigrationContext.outputFolder]). */
-fun <T> MigrationContext.readCsv(
+/** Перегрузка с явным [Path] — для случаев, когда path уже посчитан (например, относительно [RunScope.outputFolder]). */
+fun <T> RunScope.readCsv(
     path: Path,
-    onRowError: OnError = OnError.Fail,
+    onRowError: ItemError<Map<String, String>> = ItemError.Fail,
     mapper: (Map<String, String>) -> T,
 ): Sequence<T> = lazyCsvSequence(onRowError, mapper) { Files.newInputStream(path) }
 
@@ -50,22 +49,21 @@ fun <T> MigrationContext.readCsv(
  * если пользователь забыл консьюмить (early return, `.take(0)`, exception до итерации), файловый
  * хендл не открывается.
  *
- * Открытый stream сразу регистрируется в [MigrationContext]: `sequence { }` — это корутина, и
+ * Открытый stream сразу регистрируется в [RunScope]: `sequence { }` — это корутина, и
  * при неполном потреблении (`take(n)`, ранний выход, ошибка выше по стеку) она просто
  * бросается — `use`-блок внутри неё не доигрывает и дескриптор утёк бы. Реестр закроет его в
  * любом случае; повторный `close()` на уже закрытом потоке — no-op.
  *
  * [onRowError] применяется к КАЖДОЙ строке отдельно: и к разбору CSV, и к работе [mapper].
  * `Fail` (дефолт) — первая же плохая строка валит прогон. `Skip` / `Handle→Skip` — строка
- * аудитится в `errors.csv`, инкрементит `report.skipped` (то есть считается в `errorThreshold`)
- * и не доходит до `forEach`.
+ * аудитится в `errors.csv`, инкрементит `report.sourceSkipped` и не доходит до обработчика стадии.
  *
  * В аудит уезжает сама разобранная строка (`Map<String, String>`), иначе по `errors.csv`
  * невозможно понять, какая именно строка сломалась. Если в колонках есть чувствительные данные,
  * сократи представление: `errors.includeItem<Map<String, String>> { "id=" + it["id"] }`.
  */
-private fun <T> MigrationContext.lazyCsvSequence(
-    onRowError: OnError,
+private fun <T> RunScope.lazyCsvSequence(
+    onRowError: ItemError<Map<String, String>>,
     mapper: (Map<String, String>) -> T,
     openStream: () -> InputStream,
 ): Sequence<T> = sequence {
@@ -85,7 +83,7 @@ private fun <T> MigrationContext.lazyCsvSequence(
                     var raw: Map<String, String>? = null
                     try {
                         // next() тоже под политикой: битая строка (рваные кавычки, лишние
-                        // колонки) — это ровно тот случай, ради которого пишут OnError.Skip.
+                        // колонки) — это ровно тот случай, ради которого пишут ItemError.Skip.
                         raw = iter.next()
                         value = mapper(raw)
                         ok = true
@@ -103,26 +101,24 @@ private fun <T> MigrationContext.lazyCsvSequence(
 
 /**
  * Применяет [onRowError] к сбойной строке. `Fail` пробрасывает исходное исключение;
- * `Skip` аудитит строку, считает её в `report.skipped` и проверяет `errorThreshold` — ровно та
- * же механика, что и у `forEach`, чтобы порог считался по всем ошибкам прогона, а не только по
- * ошибкам тела цикла.
+ * `Skip` аудитит строку и считает её в `report.sourceSkipped` — отдельно от item-skip'ов
+ * стадии: такая строка никогда не была `processed`, и смешивать её со `skipped` значило бы
+ * сломать тождество `processed = successful + skipped + failed`.
  */
-private fun MigrationContext.handleRowError(e: Throwable, onRowError: OnError, row: Map<String, String>?) {
+private fun RunScope.handleRowError(e: Throwable, onRowError: ItemError<Map<String, String>>, row: Map<String, String>?) {
     if (e is InterruptedException) {
         Thread.currentThread().interrupt()
         throw e
     }
     val decision = when (onRowError) {
-        is OnError.Fail -> OnError.Decision.Fail
-        is OnError.Skip -> OnError.Decision.Skip
-        is OnError.Handle -> onRowError.decide(e, null)
+        is ItemError.Fail -> ItemError.Decision.Fail
+        is ItemError.Skip -> ItemError.Decision.Skip
+        // Классификатор получает саму разобранную строку: без неё нельзя отличить битую запись
+        // от записи с недопустимым значением.
+        is ItemError.Handle -> onRowError.decide(e, row ?: emptyMap())
     }
-    if (decision == OnError.Decision.Fail) throw e
+    if (decision == ItemError.Decision.Fail) throw e
 
     auditError(e, row)
-    report.incSkipped()
-    if (errorThreshold > 0) {
-        val skipped = report.skippedCount()
-        if (skipped > errorThreshold) throw ErrorThresholdExceeded(errorThreshold, skipped)
-    }
+    report.incSourceSkipped()
 }

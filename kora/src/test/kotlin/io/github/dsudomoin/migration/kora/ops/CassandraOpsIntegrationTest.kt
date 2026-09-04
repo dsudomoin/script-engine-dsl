@@ -1,7 +1,7 @@
 package io.github.dsudomoin.migration.kora.ops
 
 import com.datastax.oss.driver.api.core.CqlSession
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -49,7 +49,7 @@ class CassandraOpsIntegrationTest {
 
     @Test
     fun `query читает строки`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ids = with(ctx) {
             cassandra(session).query("select id from t.items") { it.getString("id")!! }
         }
@@ -58,10 +58,10 @@ class CassandraOpsIntegrationTest {
 
     @Test
     fun `execute под dry-run не меняет таблицу`() {
-        val dry = DefaultMigrationContext.test(dryRun = true)
+        val dry = RunContext.test(dryRun = true)
         with(dry) { cassandra(session).execute("update t.items set value = 99 where id = 'a'") }
 
-        val real = DefaultMigrationContext.test()
+        val real = RunContext.test()
         val v = with(real) {
             cassandra(session).query("select value from t.items where id = 'a'") { it.getInt("value") }
         }.first()
@@ -70,7 +70,7 @@ class CassandraOpsIntegrationTest {
 
     @Test
     fun `query with IN ids - List bound через setList с inferred element class`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ids = listOf("a", "c")     // 'b' намеренно пропущен
         val result = with(ctx) {
             cassandra(session).query(
@@ -87,7 +87,7 @@ class CassandraOpsIntegrationTest {
         // (driver вернёт CodecNotFound). Реальный use case Set-ветки в setExplicit — write
         // в колонку типа set<text>.
         session.execute("create table if not exists t.tagged(id text primary key, tags set<text>)")
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         with(ctx) {
             cassandra(session).execute(
                 "insert into t.tagged(id, tags) values (:id, :tags)",
@@ -106,7 +106,7 @@ class CassandraOpsIntegrationTest {
 
     @Test
     fun `query with IN - пустой List бросает IllegalArgumentException с понятной message`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val ex = runCatching {
             with(ctx) {
                 cassandra(session).query(
@@ -121,7 +121,7 @@ class CassandraOpsIntegrationTest {
 
     @Test
     fun `batch insert - множество строк за раз`() {
-        val real = DefaultMigrationContext.test()
+        val real = RunContext.test()
         val items = listOf("d" to 4, "e" to 5)
         with(real) {
             cassandra(session).batch("insert into t.items(id, value) values (:id, :v)", items) { b, it ->

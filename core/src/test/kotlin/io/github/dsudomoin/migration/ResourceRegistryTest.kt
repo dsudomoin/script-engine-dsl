@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration
 
-import io.github.dsudomoin.migration.internal.DefaultMigrationContext
+import io.github.dsudomoin.migration.internal.RunContext
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CountDownLatch
@@ -12,7 +12,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `close - в обратном порядке регистрации`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val closedOrder = mutableListOf<String>()
         ctx.register(AutoCloseable { closedOrder += "A" })
         ctx.register(AutoCloseable { closedOrder += "B" })
@@ -25,7 +25,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `close - изоляция падающих ресурсов, остальные закрываются`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val closed = mutableListOf<String>()
         ctx.register(AutoCloseable { closed += "A" })
         ctx.register(AutoCloseable { throw RuntimeException("B fails") })
@@ -44,7 +44,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `close - идемпотентность, повторный вызов - no-op`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val count = AtomicInteger()
         ctx.register(AutoCloseable { count.incrementAndGet() })
 
@@ -57,7 +57,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `register - thread-safe под параллельной регистрацией`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         val workers = 16
         val perWorker = 100
         val expectedTotal = workers * perWorker
@@ -88,7 +88,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `register - после close ресурс закрывается немедленно`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         ctx.closeRegistered()
 
         var closedLate = false
@@ -99,7 +99,7 @@ class ResourceRegistryTest {
 
     @Test
     fun `register - после close падающий ресурс идёт в warnings и не бросает`() {
-        val ctx = DefaultMigrationContext.test()
+        val ctx = RunContext.test()
         ctx.closeRegistered()
 
         ctx.register(AutoCloseable { throw RuntimeException("late fail") })
