@@ -1049,7 +1049,8 @@ API.
 ### 8.1 SQL (`jdbc`, `transactional`)
 
 ```kotlin
-fun RunScope.jdbc(db: JdbcConnectionFactory): SqlOps
+fun RunScope.jdbc(db: JdbcConnectionFactory): SqlReadOps      // query, stream
+fun HandlerScope.jdbc(db: JdbcConnectionFactory): SqlOps      // + execute, batch, executeReturning
 
 class SqlOps {
     // READ-ONLY (not gated by dry-run, so writes are rejected up front)
@@ -1070,7 +1071,7 @@ class SqlOps {
                              mapper: (ResultSet) -> T): List<T>               // dry-run: emptyList()
 }
 
-fun <R> RunScope.transactional(ops: SqlOps, block: SqlOps.() -> R): R
+fun <R> HandlerScope.transactional(ops: SqlOps, block: SqlOps.() -> R): R
 ```
 
 `query` and `stream` accept **read statements only**. The first keyword
@@ -1158,8 +1159,8 @@ whole. Reads (`query`, `stream`) still work, each in its own mini-tx.
 ### 8.2 Kafka (`kafka`, `topic`)
 
 ```kotlin
-fun <K, V> RunScope.kafka(producer: Producer<K, V>): KafkaOps<K, V>
-fun <K, V> RunScope.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V>
+fun <K, V> HandlerScope.kafka(producer: Producer<K, V>): KafkaOps<K, V>
+fun <K, V> HandlerScope.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V>
 
 class KafkaOps<K, V> : AutoCloseable {
     data class PublishResult(val topic: String, val partition: Int, val offset: Long)
@@ -1253,7 +1254,8 @@ class HttpOps {
     fun delete(path: String, headers: Map<String, String> = emptyMap()): Int // gated
 }
 
-fun RunScope.http(call: HttpCall): HttpOps
+fun RunScope.http(call: HttpCall): HttpReadOps        // get
+fun HandlerScope.http(call: HttpCall): HttpOps        // + post, put, patch, delete
 ```
 
 **Every method checks the status code.** Anything outside `200..299` throws
@@ -1279,7 +1281,8 @@ one-off scripts that do not want to declare a typed client.
 ### 8.4 Cassandra (`cassandra`)
 
 ```kotlin
-fun RunScope.cassandra(session: CqlSession): CassandraOps
+fun RunScope.cassandra(session: CqlSession): CassandraReadOps      // query
+fun HandlerScope.cassandra(session: CqlSession): CassandraOps      // + execute, batch
 
 class CassandraOps {
     fun <T> query(cql: String, vararg params: Pair<String, Any?>,
@@ -1609,12 +1612,12 @@ plan-build time or after the run throws `IllegalStateException`. And do not
 name the local `report` (as in `val report = output(...)`): inside the
 handler it shadows `RunScope.report`.
 
-**`errorThreshold` is per stage, per parent, and is reset at each
-boundary.** Two stages with a threshold of 2 tolerate two skips each, not
-two in total. Rows dropped by `readCsv` never touch the stage counter,
-though they do count towards the runner's global post-mortem check — which
-uses only `migration.defaults.errorThreshold` and ignores per-stage
-overrides (§7.8).
+**`errorThreshold` is per phase, per parent, and is reset at each
+boundary.** Two phases with a threshold of 2 tolerate two skips each, not
+two in total, and there is no run-wide check on top:
+`migration.defaults.errorThreshold` is only the default for a phase that
+does not set its own (§7.8). Rows dropped by `readCsv` never touch the
+phase counter at all — they land in `sourceSkipped`.
 
 **`ErrorThresholdExceeded` obeys `onUnhandled`.** It escapes the stage like
 any other failure, so with `onUnhandled = LOG_AND_COMPLETE` a run that blew
