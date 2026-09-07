@@ -423,20 +423,42 @@ audit trail.
 run; the cache lives in the run, not in the plan, so the same plan object
 can be interpreted twice without inheriting the previous run's values.
 
+Declare the dependency in the node's signature and take the value as a
+parameter — that is the form the spec asked for, and it makes a stage's
+inputs readable without opening its body:
+
 ```kotlin
 val strategies = input("strategies") {
     jdbc(db).query("select id, kind from strategies where active") { Strategy.from(it) }
 }
 
 source(
-    items = { resolve(strategies).asSequence() },
+    strategies,
+    items = { loaded -> loaded.asSequence() },
 ) { strategy -> … }
+
+// two dependencies
+source(strategies, replacements, items = { s, r -> … }) { … }
+
+// scoped: the value arrives in `parents`, where a stage almost always needs it
+scoped(
+    strategies,
+    parents = { loaded -> loaded.asSequence() },
+    items = { strategy -> pages(…) },
+) { … }
 ```
 
-`resolve` exists **only on `SourceScope`** — i.e. inside `items` and
-`parents`. A handler cannot resolve an input, and an input's own loader
-cannot resolve another input. Get a value into the handler by putting it
-into the element type, or by making it the parent of a `scoped` stage.
+These overloads are thin wrappers over the base ones — the plan and the
+interpreter know nothing about them.
+
+`resolve(input)` remains, and is still the way to get a value where no
+parameter carries it: a third dependency, or the rare `scoped` whose
+`items` needs the same input as its `parents` (it returns the same cached
+object, not a second load). It exists **only on `SourceScope`** — inside
+`items` and `parents`. A handler cannot resolve an input, and an input's
+own loader cannot resolve another input. Get a value into the handler by
+putting it into the element type, or by making it the parent of a `scoped`
+stage.
 
 An input whose loader returns `null` is memoized like any other: the value
 is wrapped before it goes into the cache, because `ConcurrentHashMap` does

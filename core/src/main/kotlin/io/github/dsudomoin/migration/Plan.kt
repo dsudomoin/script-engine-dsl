@@ -197,6 +197,77 @@ class MigrationBuilder internal constructor() {
         )
     }
 
+    /**
+     * Стадия, объявляющая свою зависимость от [input] в сигнатуре узла: значение приезжает
+     * параметром, а не достаётся вызовом `resolve` из тела.
+     *
+     * Тонкая надстройка над основной перегрузкой — план и интерпретатор о ней не знают.
+     */
+    fun <I, T> source(
+        input: Input<I>,
+        name: String? = null,
+        onItemError: ItemError<T> = ItemError.Fail,
+        completionTimeout: Duration? = null,
+        parallel: Int? = null,
+        progress: Progress = Progress.Default,
+        errorThreshold: Long? = null,
+        items: SourceScope.(I) -> Sequence<T>,
+        handle: HandlerScope.(T) -> Unit,
+    ) = source(
+        name, onItemError, completionTimeout, parallel, progress, errorThreshold,
+        items = { items(resolve(input)) },
+        handle = handle,
+    )
+
+    /** Та же форма для двух зависимостей. */
+    fun <I1, I2, T> source(
+        input1: Input<I1>,
+        input2: Input<I2>,
+        name: String? = null,
+        onItemError: ItemError<T> = ItemError.Fail,
+        completionTimeout: Duration? = null,
+        parallel: Int? = null,
+        progress: Progress = Progress.Default,
+        errorThreshold: Long? = null,
+        items: SourceScope.(I1, I2) -> Sequence<T>,
+        handle: HandlerScope.(T) -> Unit,
+    ) = source(
+        name, onItemError, completionTimeout, parallel, progress, errorThreshold,
+        items = { items(resolve(input1), resolve(input2)) },
+        handle = handle,
+    )
+
+    /**
+     * `scoped`, объявляющая зависимость родителей от [input]: значение приезжает в [parents]
+     * параметром.
+     *
+     * В [items] оно не передаётся намеренно — в подавляющем большинстве стадий родители берут из
+     * input'а ключи, а элементы читаются уже по родителю. Редкому случаю, где значение нужно и
+     * элементам, остаётся `resolve(input)` в теле: он вернёт тот же закэшированный объект.
+     */
+    fun <I, P, T> scoped(
+        input: Input<I>,
+        parents: SourceScope.(I) -> Sequence<P>,
+        name: String? = null,
+        completionTimeout: Duration? = null,
+        onItemError: ItemError<T> = ItemError.Fail,
+        parallel: Int? = null,
+        progress: Progress = Progress.Default,
+        errorThreshold: Long? = null,
+        items: SourceScope.(P) -> Sequence<T>,
+        handle: HandlerScope.(T) -> Unit,
+    ) = scoped(
+        name = name,
+        parents = { parents(resolve(input)) },
+        completionTimeout = completionTimeout,
+        onItemError = onItemError,
+        parallel = parallel,
+        progress = progress,
+        errorThreshold = errorThreshold,
+        items = items,
+        handle = handle,
+    )
+
     internal fun build(migrationName: String, author: String, onUnhandled: ScriptPolicy?): MigrationPlan {
         require(stages.isNotEmpty()) { "migration '$migrationName' declares no stage" }
         if (stages.size > 1) {

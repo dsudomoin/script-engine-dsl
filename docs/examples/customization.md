@@ -288,7 +288,8 @@ exit-код от этого не меняется.
 
 ```kotlin
 scoped(
-    parents = { resolve(segments).asSequence() },
+    segments,
+    parents = { loaded -> loaded.asSequence() },
     items = { segment ->
         val cursor = legacy.openCursor(segment)      // держит соединение
         scopedResource { cursor.close() }            // закроется на границе этого родителя

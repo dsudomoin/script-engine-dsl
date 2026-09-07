@@ -253,12 +253,12 @@ override fun plan() = migration(name = name, author = "team") {
     val processed = output("processed.csv", "id")
     val ids = input("ids") { readCsv(config.inputFile()) { it.getValue("customer_id") }.toList() }
 
-    source(name = "update", parallel = 8, onItemError = ItemError.Skip, items = { resolve(ids).asSequence() }) { id ->
+    source(ids, name = "update", parallel = 8, onItemError = ItemError.Skip, items = { it.asSequence() }) { id ->
         jdbc(db).execute("update customers set status = 'UNDER_REVIEW' where id = :id", "id" to id)
         processed.row(id)
     }
 
-    source(name = "audit", parallel = 4, items = { resolve(ids).asSequence().chunked(500) }) { batch ->
+    source(ids, name = "audit", parallel = 4, items = { it.asSequence().chunked(500) }) { batch ->
         jdbc(db).batch("insert into customer_audit(customer_id, event, ts) values (?, 'incident_review', now())", batch) { ps, id ->
             ps.setString(1, id)
         }

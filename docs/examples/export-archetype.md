@@ -297,7 +297,7 @@ override fun plan() = migration(name = name, author = "finance") {
 
     source(name = "export", items = { /* pages(...) как выше */ }) { v -> out.row(/* ... */) }
 
-    source(name = "verify", items = { sequenceOf(resolve(expected)) }) { expectedCount ->
+    source(expected, name = "verify", items = { sequenceOf(it) }) { expectedCount ->
         totals.row("expected", expectedCount)
     }
 }
