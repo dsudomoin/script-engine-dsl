@@ -59,10 +59,10 @@ class CassandraOpsIntegrationTest {
     @Test
     fun `execute под dry-run не меняет таблицу`() {
         val dry = RunContext.test(dryRun = true)
-        with(dry) { cassandra(session).execute("update t.items set value = 99 where id = 'a'") }
+        with(handler(dry)) { cassandra(session).execute("update t.items set value = 99 where id = 'a'") }
 
         val real = RunContext.test()
-        val v = with(real) {
+        val v = with(handler(real)) {
             cassandra(session).query("select value from t.items where id = 'a'") { it.getInt("value") }
         }.first()
         assertThat(v).isEqualTo(1)
@@ -123,12 +123,12 @@ class CassandraOpsIntegrationTest {
     fun `batch insert - множество строк за раз`() {
         val real = RunContext.test()
         val items = listOf("d" to 4, "e" to 5)
-        with(real) {
+        with(handler(real)) {
             cassandra(session).batch("insert into t.items(id, value) values (:id, :v)", items) { b, it ->
                 b.setString("id", it.first); b.setInt("v", it.second)
             }
         }
-        val all = with(real) {
+        val all = with(handler(real)) {
             cassandra(session).query("select id from t.items") { it.getString("id")!! }
         }
         assertThat(all).contains("d", "e")
