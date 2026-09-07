@@ -1,6 +1,8 @@
 package io.github.dsudomoin.migration
 
 import io.github.dsudomoin.migration.csv.CsvOutput
+import java.nio.file.InvalidPathException
+import java.nio.file.Path
 import java.time.Duration
 
 /**
@@ -101,6 +103,15 @@ class MigrationPlan internal constructor(
     internal val validation: (InputScope.() -> Unit)?,
 )
 
+/**
+ * Имена, которые движок открывает в `outputFolder` сам.
+ *
+ * Пользовательский `output` с таким именем писал бы в тот же файл параллельно с аудитором или
+ * файловым логгером, и оба открывают его с `TRUNCATE_EXISTING` — то есть аудит прогона молча
+ * уничтожался бы ровно там, где он нужнее всего.
+ */
+private val RESERVED_ARTIFACTS = setOf("errors.csv", "errors.log", "migration.log")
+
 /** Построитель плана. Экземпляр живёт только внутри вызова [migration]. */
 @MigrationDsl
 class MigrationBuilder internal constructor() {
@@ -121,6 +132,17 @@ class MigrationBuilder internal constructor() {
      */
     fun output(filename: String, vararg headers: String): OutputHandle {
         require(outputs.none { it.filename == filename }) { "duplicate output '$filename'" }
+        val normalized = try {
+            Path.of(filename).normalize()
+        } catch (e: InvalidPathException) {
+            throw IllegalArgumentException("output '$filename' is not a valid path", e)
+        }
+        require(!normalized.isAbsolute && !normalized.startsWith("..")) {
+            "output '$filename' must stay inside the migration outputFolder"
+        }
+        require(normalized.toString() !in RESERVED_ARTIFACTS) {
+            "output '$filename' uses a reserved engine artifact name: $RESERVED_ARTIFACTS"
+        }
         return OutputHandle(filename, headers.toList()).also { outputs += it }
     }
 

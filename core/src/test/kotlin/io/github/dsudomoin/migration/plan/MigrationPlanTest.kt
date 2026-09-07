@@ -87,4 +87,39 @@ class MigrationPlanTest {
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("stage")
     }
+
+    @Test
+    fun `зарезервированные имена артефактов запрещены`() {
+        listOf("errors.csv", "errors.log", "migration.log", "./errors.csv", "sub/../errors.log")
+            .forEach { name ->
+                assertThatThrownBy {
+                    migration("R", "t") { output(name); source(items = { sequenceOf(1) }) { } }
+                }
+                    .describedAs(name)
+                    .isInstanceOf(IllegalArgumentException::class.java)
+                    .hasMessageContaining("reserved")
+            }
+    }
+
+    @Test
+    fun `output не может выйти за папку артефактов`() {
+        listOf("../escape.csv", "/tmp/absolute.csv").forEach { name ->
+            assertThatThrownBy {
+                migration("R", "t") { output(name); source(items = { sequenceOf(1) }) { } }
+            }
+                .describedAs(name)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("outputFolder")
+        }
+    }
+
+    @Test
+    fun `обычные и вложенные имена по-прежнему разрешены`() {
+        val plan = migration("R", "t") {
+            output("report.csv", "a")
+            output("nested/report.csv", "a")
+            source(items = { sequenceOf(1) }) { }
+        }
+        assertThat(plan.outputs.map { it.filename }).containsExactly("report.csv", "nested/report.csv")
+    }
 }
