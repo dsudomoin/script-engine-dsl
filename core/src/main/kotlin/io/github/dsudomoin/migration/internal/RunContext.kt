@@ -60,6 +60,17 @@ class RunContext internal constructor(
         errors.report(e, item)
     }
 
+    /**
+     * Фабрика **не должна** сама вызывать `shared`: оба вызова идут в один `ConcurrentHashMap`, а
+     * вложенный `computeIfAbsent` бросает `IllegalStateException("Recursive update")` — причём по
+     * совпадению бина, то есть не на каждом запуске. Если нужен «общий» объект, собранный из
+     * другого «общего», получи вложенный до входа сюда:
+     *
+     * ```
+     * val inner = shared(a) { … }
+     * return shared(b) { Outer(inner) }
+     * ```
+     */
     override fun <T : AutoCloseable> shared(key: Any, factory: () -> T): T {
         // После закрытия реестра не кэшируем: register ниже закроет созданное сразу, и класть
         // закрытый объект в мапу как «общий на прогон» было бы враньём.
