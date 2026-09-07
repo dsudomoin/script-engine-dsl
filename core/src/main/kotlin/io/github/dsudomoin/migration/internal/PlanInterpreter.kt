@@ -55,10 +55,17 @@ class PlanInterpreter(
                 StageScope(base, CompletionTracker(), inputs).check()
             }
 
-            for (stage in plan.stages) {
-                when (stage) {
-                    is Stage.Flat<*> -> runFlat(stage)
-                    is Stage.Scoped<*, *> -> runScoped(stage)
+            plan.stages.forEachIndexed { index, stage ->
+                // Узел плана и есть фаза. Имя обязательно, когда стадий больше одной (проверяет
+                // билдер); у единственной неявной фазы оно нужно лишь как ключ и в отчёт не идёт.
+                base.report.beginPhase(stage.name ?: "phase-${index + 1}")
+                try {
+                    when (stage) {
+                        is Stage.Flat<*> -> runFlat(stage)
+                        is Stage.Scoped<*, *> -> runScoped(stage)
+                    }
+                } finally {
+                    base.report.endPhase()
                 }
             }
         } finally {

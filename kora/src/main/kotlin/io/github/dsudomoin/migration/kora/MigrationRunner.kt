@@ -177,7 +177,7 @@ class MigrationRunner(
             // не имеет права закончиться нулём.
             // Отправленное, но неподтверждённое, обязано поднимать код возврата независимо от
             // ScriptPolicy: LOG_AND_COMPLETE не должен превращать потерянные сообщения в ноль.
-            val unconfirmed = report.unconfirmedEffectsCount()
+            val unconfirmed = report.effectFailureCount()
             if (unconfirmed > 0 && code == 0) {
                 log.error("$unconfirmed async effect(s) were never confirmed; see the report")
                 code = 1

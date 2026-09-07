@@ -34,12 +34,59 @@ class ReportBuilder(
     private val sourceSkipped = AtomicLong()
     private val rawPages = AtomicLong()
     private val rawRows = AtomicLong()
+    private val unhandledFailures = AtomicLong()
     private val warnings = CopyOnWriteArrayList<String>()
 
-    fun incProcessed()                { processed.incrementAndGet() }
-    fun incSuccessful()               { successful.incrementAndGet() }
-    fun incSkipped()                  { skipped.incrementAndGet() }
-    fun incFailed()                   { failed.incrementAndGet() }
+    /** Счётчики одной фазы. Дублируют итоговые, а не заменяют их: итоги прогона считаются как и раньше. */
+    private class PhaseCounters(val name: String) {
+        val processed = AtomicLong()
+        val successful = AtomicLong()
+        val skipped = AtomicLong()
+        val failed = AtomicLong()
+        val sourceSkipped = AtomicLong()
+        val acknowledgedPublishes = AtomicLong()
+        val failedEffects = AtomicLong()
+        val abandonedPublishes = AtomicLong()
+        val lateRegistered = AtomicLong()
+        val rawPages = AtomicLong()
+        val rawRows = AtomicLong()
+        val dryRunSkipped = ConcurrentHashMap<String, AtomicLong>()
+        val appliedWrites = ConcurrentHashMap<String, AtomicLong>()
+        val rejectedWrites = ConcurrentHashMap<String, AtomicLong>()
+    }
+
+    private val phaseList = CopyOnWriteArrayList<PhaseCounters>()
+
+    // Фазы строго последовательны, а интерпретатор дожидается всех воркеров и барьера прежде чем
+    // закрыть фазу — поэтому «текущая фаза» это одно volatile-поле, а не стек и не ThreadLocal.
+    @Volatile
+    private var currentPhase: PhaseCounters? = null
+
+    /** Открыть фазу. Вызывает только интерпретатор плана. */
+    fun beginPhase(name: String) {
+        val counters = PhaseCounters(name)
+        phaseList += counters
+        currentPhase = counters
+    }
+
+    /** Закрыть текущую фазу. Вызывает только интерпретатор плана. */
+    fun endPhase() {
+        currentPhase = null
+    }
+
+    /**
+     * Отказ уровня прогона или стадии — не исход элемента.
+     *
+     * Отдельно от [incFailed] намеренно: у такого отказа могло не быть обрабатываемого элемента
+     * (ошибка источника, валидации, барьера), и общий счётчик ломал бы тождество
+     * `processed = successful + skipped + failed`.
+     */
+    fun recordRunFailure()            { unhandledFailures.incrementAndGet() }
+
+    fun incProcessed()                { processed.incrementAndGet(); currentPhase?.processed?.incrementAndGet() }
+    fun incSuccessful()               { successful.incrementAndGet(); currentPhase?.successful?.incrementAndGet() }
+    fun incSkipped()                  { skipped.incrementAndGet(); currentPhase?.skipped?.incrementAndGet() }
+    fun incFailed()                   { failed.incrementAndGet(); currentPhase?.failed?.incrementAndGet() }
 
     /**
      * Строка источника отброшена при чтении (битый CSV) и до стадии не дошла.
@@ -47,23 +94,26 @@ class ReportBuilder(
      * Отдельный счётчик, а не `skipped`: иначе ломается тождество
      * `processed = successful + skipped + failed` — такая строка никогда не была `processed`.
      */
-    fun incSourceSkipped()            { sourceSkipped.incrementAndGet() }
+    fun incSourceSkipped()            { sourceSkipped.incrementAndGet(); currentPhase?.sourceSkipped?.incrementAndGet() }
 
     /**
      * Инкрементить счётчик dry-run-пропущенных write'ов по метке (используется внутри `guardWrite`).
      */
     fun incDryRunSkipped(label: String) {
         dryRunSkipped.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
+        currentPhase?.dryRunSkipped?.computeIfAbsent(label) { AtomicLong() }?.incrementAndGet()
     }
 
     /** Запись применилась. */
     fun incAppliedWrite(label: String) {
         appliedWrites.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
+        currentPhase?.appliedWrites?.computeIfAbsent(label) { AtomicLong() }?.incrementAndGet()
     }
 
     /** Запись отклонена — ожидаемый отрицательный исход, а не сбой. */
     fun incRejectedWrite(label: String) {
         rejectedWrites.computeIfAbsent(label) { AtomicLong() }.incrementAndGet()
+        currentPhase?.rejectedWrites?.computeIfAbsent(label) { AtomicLong() }?.incrementAndGet()
     }
 
     /** Итоги барьера scope'а: подтверждено, отказано, брошено по таймауту, зарегистрировано поздно. */
@@ -72,16 +122,30 @@ class ReportBuilder(
         failedEffects.addAndGet(failed)
         abandonedPublishes.addAndGet(abandoned)
         lateRegistered.addAndGet(late)
+        currentPhase?.let {
+            it.acknowledgedPublishes.addAndGet(acked)
+            it.failedEffects.addAndGet(failed)
+            it.abandonedPublishes.addAndGet(abandoned)
+            it.lateRegistered.addAndGet(late)
+        }
     }
 
     /** Сырая страница пагинатора: единственное место, где видно «прочитано» до фильтров. */
     fun addRawPage(rows: Int) {
         rawPages.incrementAndGet()
         rawRows.addAndGet(rows.toLong())
+        currentPhase?.let { it.rawPages.incrementAndGet(); it.rawRows.addAndGet(rows.toLong()) }
     }
 
-    /** Число брошенных и поздно зарегистрированных эффектов — runner поднимает по ним exit-код. */
-    fun unconfirmedEffectsCount(): Long = abandonedPublishes.get() + lateRegistered.get()
+    /**
+     * Отказы эффектов, из-за которых прогон не имеет права закончиться нулём: провалившиеся,
+     * не дождавшиеся подтверждения и зарегистрированные после барьера.
+     *
+     * `failedEffects` входит сюда наравне с остальными: известный отказ доставки — это потерянное
+     * сообщение, а не «залогированная ошибка», и LOG_AND_COMPLETE не должен превращать его в ноль.
+     */
+    fun effectFailureCount(): Long =
+        failedEffects.get() + abandonedPublishes.get() + lateRegistered.get()
 
     /** Добавить нефатальное предупреждение (например, исключение при закрытии ресурса). */
     fun addWarning(message: String)   { warnings.add(message) }
@@ -122,9 +186,29 @@ class ReportBuilder(
             sourceSkipped = sourceSkipped.get(),
             rawPages = rawPages.get(),
             rawRows = rawRows.get(),
+            unhandledFailures = unhandledFailures.get(),
+            phases = if (phaseList.size > 1) phaseList.map { it.snapshot() } else emptyList(),
             errorsFile = errorsFile,
             tracesFile = tracesFile,
             warnings = warnings.toList(),
         )
     }
+
+    private fun PhaseCounters.snapshot() = PhaseReport(
+        name = name,
+        processed = processed.get(),
+        successful = successful.get(),
+        skipped = skipped.get(),
+        failed = failed.get(),
+        sourceSkipped = sourceSkipped.get(),
+        appliedWrites = appliedWrites.mapValues { it.value.get() },
+        rejectedWrites = rejectedWrites.mapValues { it.value.get() },
+        dryRunSkipped = dryRunSkipped.mapValues { it.value.get() },
+        acknowledgedPublishes = acknowledgedPublishes.get(),
+        failedEffects = failedEffects.get(),
+        abandonedPublishes = abandonedPublishes.get(),
+        lateRegistered = lateRegistered.get(),
+        rawPages = rawPages.get(),
+        rawRows = rawRows.get(),
+    )
 }
