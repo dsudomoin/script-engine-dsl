@@ -42,7 +42,7 @@ class SqlOpsGuardTest {
         val ctx = RunContext.test()
 
         val thrown = catchThrowable {
-            with(ctx) { jdbc(db).query("insert into orders(id) values (1) returning id") { it.getLong(1) } }
+            with(handler(ctx)) { jdbc(db).query("insert into orders(id) values (1) returning id") { it.getLong(1) } }
         }
 
         // Иначе под dry-run этот запрос выполнился бы В БОЮ: query не проходит гейт и не должен.
@@ -58,7 +58,7 @@ class SqlOpsGuardTest {
 
         // Дойти до соединения не должно — падение здесь означало бы, что запрос отвергнут разбором.
         val thrown = catchThrowable {
-            with(ctx) { jdbc(db).query("-- отчёт за месяц\n  select 1") { it.getLong(1) } }
+            with(handler(ctx)) { jdbc(db).query("-- отчёт за месяц\n  select 1") { it.getLong(1) } }
         }
 
         assertThat(thrown).isInstanceOf(AssertionError::class.java)
@@ -68,7 +68,7 @@ class SqlOpsGuardTest {
     fun `executeReturning гейтится dry-run'ом и не ходит в базу`() {
         val ctx = RunContext.test(dryRun = true)
 
-        val ids = with(ctx) {
+        val ids = with(handler(ctx)) {
             jdbc(db).executeReturning("insert into orders(id) values (1) returning id") { it.getLong(1) }
         }
 
@@ -101,7 +101,7 @@ class SqlOpsGuardTest {
         val ctx = RunContext.test(dryRun = true)
 
         val thrown = catchThrowable {
-            with(ctx) {
+            with(handler(ctx)) {
                 transactional(jdbc(db)) {
                     transactional(jdbc(db)) { 1 }
                 }

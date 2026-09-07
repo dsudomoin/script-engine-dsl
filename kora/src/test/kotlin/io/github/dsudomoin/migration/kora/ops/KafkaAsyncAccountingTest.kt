@@ -94,7 +94,7 @@ class KafkaAsyncAccountingTest {
         val ctx = RunContext.test(outputFolder = dir)
         val p = producer()
 
-        val ops = with(ctx) { kafka(p) }
+        val ops = with(handler(ctx)) { kafka(p) }
         val future = ops.publishAsync("customers.resync", "cust-1", "{}")
         p.completeNext()
 
@@ -108,7 +108,7 @@ class KafkaAsyncAccountingTest {
         val ctx = RunContext.test(dryRun = true, outputFolder = dir)
         val p = producer()
 
-        val result = with(ctx) { kafka(p).publishAsync("customers.resync", "cust-1", "{}") }.get()
+        val result = with(handler(ctx)) { kafka(p).publishAsync("customers.resync", "cust-1", "{}") }.get()
 
         assertThat(result).isNull()
         assertThat(p.history()).isEmpty()
@@ -122,8 +122,8 @@ class KafkaAsyncAccountingTest {
 
         // Вызов внутри forEach — штатный сценарий; без мемоизации реестр ресурсов рос бы
         // по объекту на item и сам стал бы утечкой на миллионных прогонах.
-        val opsList = (1..100).map { with(ctx) { kafka(p) } }
-        val topics = (1..100).map { with(ctx) { topic(p, "customers.resync") } }
+        val opsList = (1..100).map { with(handler(ctx)) { kafka(p) } }
+        val topics = (1..100).map { with(handler(ctx)) { topic(p, "customers.resync") } }
 
         assertThat(opsList.distinct()).hasSize(1)
         assertThat(topics.distinct()).hasSize(1)

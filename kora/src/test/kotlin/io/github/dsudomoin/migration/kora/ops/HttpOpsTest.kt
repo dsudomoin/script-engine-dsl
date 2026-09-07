@@ -13,7 +13,7 @@ class HttpOpsTest {
         val calls = mutableListOf<String>()
         val stub: HttpCall = { m, p, _, _ -> calls += "$m $p"; 200 }
 
-        val status = with(ctx) { http(stub).get("/orders/42") }
+        val status = with(handler(ctx)) { http(stub).get("/orders/42") }
 
         assertThat(status).isEqualTo(200)
         assertThat(calls).containsExactly("GET /orders/42")
@@ -25,7 +25,7 @@ class HttpOpsTest {
         var called = false
         val stub: HttpCall = { _, _, _, _ -> called = true; 201 }
 
-        val status = with(ctx) { http(stub).post("/hooks", "body".toByteArray()) }
+        val status = with(handler(ctx)) { http(stub).post("/hooks", "body".toByteArray()) }
 
         assertThat(called).isFalse()
         // Не 0: вызывающий код почти всегда смотрит на статус, и ноль отправил бы репетицию
@@ -39,7 +39,7 @@ class HttpOpsTest {
         val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 204 }
 
-        val status = with(ctx) { http(stub).post("/hooks", ByteArray(0)) }
+        val status = with(handler(ctx)) { http(stub).post("/hooks", ByteArray(0)) }
 
         assertThat(status).isEqualTo(204)
     }
@@ -50,7 +50,7 @@ class HttpOpsTest {
         val stub: HttpCall = { _, _, _, _ -> throw java.net.SocketTimeoutException("timeout") }
 
         val ex = runCatching {
-            with(ctx) { http(stub).post("/hooks", ByteArray(0)) }
+            with(handler(ctx)) { http(stub).post("/hooks", ByteArray(0)) }
         }.exceptionOrNull()
 
         assertThat(ex).isInstanceOf(java.net.SocketTimeoutException::class.java)
@@ -63,7 +63,7 @@ class HttpOpsTest {
         val stub: HttpCall = { _, _, _, _ -> error("network down") }
 
         val ex = runCatching {
-            with(ctx) { http(stub).get("/health") }
+            with(handler(ctx)) { http(stub).get("/health") }
         }.exceptionOrNull()
 
         assertThat(ex).isNotNull()
@@ -75,7 +75,7 @@ class HttpOpsTest {
         val ctx = RunContext.test(dryRun = true)
         val stub: HttpCall = { _, _, _, _ -> 200 }
 
-        with(ctx) {
+        with(handler(ctx)) {
             http(stub).patch("/a")
             http(stub).put("/b")
             http(stub).delete("/c")
@@ -97,7 +97,7 @@ class HttpOpsStatusTest {
         val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 500 }
 
-        val thrown = catchThrowable { with(ctx) { http(stub).post("/hooks") } }
+        val thrown = catchThrowable { with(handler(ctx)) { http(stub).post("/hooks") } }
 
         assertThat(thrown)
             .isInstanceOf(HttpStatusException::class.java)
@@ -111,7 +111,7 @@ class HttpOpsStatusTest {
         val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 404 }
 
-        assertThat(catchThrowable { with(ctx) { http(stub).get("/orders/42") } })
+        assertThat(catchThrowable { with(handler(ctx)) { http(stub).get("/orders/42") } })
             .isInstanceOf(HttpStatusException::class.java)
     }
 
@@ -120,6 +120,6 @@ class HttpOpsStatusTest {
         val ctx = RunContext.test()
         val stub: HttpCall = { _, _, _, _ -> 299 }
 
-        assertThat(with(ctx) { http(stub).put("/orders/42") }).isEqualTo(299)
+        assertThat(with(handler(ctx)) { http(stub).put("/orders/42") }).isEqualTo(299)
     }
 }

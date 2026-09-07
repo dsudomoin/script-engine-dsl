@@ -27,7 +27,7 @@ class KafkaTopicCloseRaceTest {
     fun `close из N потоков — flush вызван ровно один раз`(@TempDir tmp: Path) {
         val producer = FlushCountingMockProducer()
         val ctx = RunContext.test(outputFolder = tmp)
-        val t = with(ctx) { topic(producer, "test-topic") }
+        val t = with(handler(ctx)) { topic(producer, "test-topic") }
 
         val workers = 32
         val pool = Executors.newFixedThreadPool(workers)
@@ -52,7 +52,7 @@ class KafkaTopicCloseRaceTest {
     fun `close под dry-run — flush не вызывается ни разу`(@TempDir tmp: Path) {
         val producer = FlushCountingMockProducer()
         val ctx = RunContext.test(dryRun = true, outputFolder = tmp)
-        val t = with(ctx) { topic(producer, "test-topic") }
+        val t = with(handler(ctx)) { topic(producer, "test-topic") }
 
         t.close()
         t.close()

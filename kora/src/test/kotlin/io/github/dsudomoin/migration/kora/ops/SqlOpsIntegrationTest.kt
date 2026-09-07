@@ -48,7 +48,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `query читает строки`() {
         val ctx = RunContext.test()
-        val ids = with(ctx) {
+        val ids = with(handler(ctx)) {
             jdbc(db).query("select id from orders where status = :s", "s" to 1) { it.getLong("id") }
         }
         assertThat(ids).hasSize(2)
@@ -57,10 +57,10 @@ class SqlOpsIntegrationTest {
     @Test
     fun `execute под dry-run не меняет БД`() {
         val dryCtx = RunContext.test(dryRun = true)
-        with(dryCtx) { jdbc(db).execute("update orders set status = 99") }
+        with(handler(dryCtx)) { jdbc(db).execute("update orders set status = 99") }
 
         val realCtx = RunContext.test(dryRun = false)
-        val count = with(realCtx) {
+        val count = with(handler(realCtx)) {
             jdbc(db).query("select count(*) as c from orders where status = 99") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(0)
@@ -70,7 +70,7 @@ class SqlOpsIntegrationTest {
     fun `validate - missing parameter бросает IllegalArgumentException`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).query("select id from orders where status = :s") { it.getLong("id") }
             }
         }.exceptionOrNull()
@@ -82,7 +82,7 @@ class SqlOpsIntegrationTest {
     fun `validate - extra parameter бросает IllegalArgumentException`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).query("select id from orders", "extra" to 1) { it.getLong("id") }
             }
         }.exceptionOrNull()
@@ -94,7 +94,7 @@ class SqlOpsIntegrationTest {
     fun `validate - duplicate keys бросают IllegalArgumentException`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).query("select id from orders where status = :s", "s" to 1, "s" to 2) { it.getLong("id") }
             }
         }.exceptionOrNull()
@@ -105,7 +105,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `parseSql - colon name внутри строки не парсится как параметр`() {
         val ctx = RunContext.test()
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             jdbc(db).query("select ':fake' as v") { it.getString("v") }
         }
         assertThat(result).containsExactly(":fake")
@@ -116,7 +116,7 @@ class SqlOpsIntegrationTest {
         val ctx = RunContext.test()
         // `:fake` спрятан внутри /* ... */ — не должен попасть в список named-params,
         // SQL валиден, query выполняется без ошибки про missing parameter.
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             jdbc(db).query("select /* :fake */ 'literal' as v") { it.getString("v") }
         }
         assertThat(result).containsExactly("literal")
@@ -126,7 +126,7 @@ class SqlOpsIntegrationTest {
     fun `parseSql - colon name внутри dollar-quoted строки не парсится`() {
         val ctx = RunContext.test()
         // `:fake` спрятан внутри $$...$$ — PostgreSQL читает как литерал, наш парсер тоже.
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             jdbc(db).query("select \$\$:fake\$\$ as v") { it.getString("v") }
         }
         assertThat(result).containsExactly(":fake")
@@ -136,7 +136,7 @@ class SqlOpsIntegrationTest {
     fun `parseSql - colon name внутри tagged dollar-quoted строки не парсится`() {
         val ctx = RunContext.test()
         // `$body$:fake$body$` — tagged variant, тоже не должен зацепиться.
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             jdbc(db).query("select \$body\$:fake\$body\$ as v") { it.getString("v") }
         }
         assertThat(result).containsExactly(":fake")
@@ -146,7 +146,7 @@ class SqlOpsIntegrationTest {
     fun `parseSql - block comment не мешает реальному named-параметру вне него`() {
         val ctx = RunContext.test()
         // /* :fake */ комментарий, а :s — настоящий параметр.
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             jdbc(db).query(
                 "select /* :fake */ :s::int as v",
                 "s" to 42,
@@ -158,13 +158,13 @@ class SqlOpsIntegrationTest {
     @Test
     fun `transactional - оба execute коммитятся при успешном выходе`() {
         val ctx = RunContext.test()
-        with(ctx) {
+        with(handler(ctx)) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 50)
                 execute("insert into orders(status) values (:s)", "s" to 51)
             }
         }
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status in (50, 51)") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(2)
@@ -174,7 +174,7 @@ class SqlOpsIntegrationTest {
     fun `transactional - rollback при throw, ни одной строки`() {
         val ctx = RunContext.test()
         try {
-            with(ctx) {
+            with(handler(ctx)) {
                 transactional(jdbc(db)) {
                     execute("insert into orders(status) values (:s)", "s" to 60)
                     throw RuntimeException("boom")
@@ -183,7 +183,7 @@ class SqlOpsIntegrationTest {
         } catch (e: RuntimeException) {
             assertThat(e.message).isEqualTo("boom")
         }
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status = 60") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(0)
@@ -192,7 +192,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `transactional - query внутри tx видит свои uncommitted inserts`() {
         val ctx = RunContext.test()
-        val visible = with(ctx) {
+        val visible = with(handler(ctx)) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 70)
                 query("select count(*) as c from orders where status = 70") { it.getInt("c") }.first()
@@ -204,9 +204,9 @@ class SqlOpsIntegrationTest {
     @Test
     fun `nested transactional - бросает IllegalStateException`() {
         val ctx = RunContext.test()
-        val ops = with(ctx) { jdbc(db) }
+        val ops = with(handler(ctx)) { jdbc(db) }
         try {
-            with(ctx) {
+            with(handler(ctx)) {
                 transactional(ops) {
                     transactional(this) {
                         execute("insert into orders(status) values (:s)", "s" to 80)
@@ -217,7 +217,7 @@ class SqlOpsIntegrationTest {
         } catch (e: IllegalStateException) {
             assertThat(e.message).contains("nested transactional")
         }
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status = 80") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(0)
@@ -229,9 +229,9 @@ class SqlOpsIntegrationTest {
         // и вызывает `transactional(ops)` ПОВТОРНО изнутри уже открытой tx. Без ThreadLocal-guard'а
         // в SqlOps это открывало бы вторую независимую tx — нарушение «nested не поддерживается».
         val ctx = RunContext.test()
-        val outerOps = with(ctx) { jdbc(db) }                   // inTx == false
+        val outerOps = with(handler(ctx)) { jdbc(db) }                   // inTx == false
         try {
-            with(ctx) {
+            with(handler(ctx)) {
                 transactional(outerOps) {
                     // Внутри — `this` это tx-bound SqlOps. Но юзер передаёт *внешний* outerOps:
                     transactional(outerOps) {
@@ -245,7 +245,7 @@ class SqlOpsIntegrationTest {
             assertThat(e.message).contains("already open on this thread")
         }
         // Ничего не записалось: outer tx тоже не закоммитилась (исключение вылетело наверх).
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status = 81") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(0)
@@ -256,7 +256,7 @@ class SqlOpsIntegrationTest {
         // Sanity: ThreadLocal-флаг должен сбрасываться по выходу из transactional, иначе второй
         // (не вложенный, а *последующий*) `transactional` упал бы false-positive'ом.
         val ctx = RunContext.test()
-        with(ctx) {
+        with(handler(ctx)) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 82)
             }
@@ -264,7 +264,7 @@ class SqlOpsIntegrationTest {
                 execute("insert into orders(status) values (:s)", "s" to 83)
             }
         }
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status in (82, 83)") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(2)
@@ -273,7 +273,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `transactional под dry-run - execute не пишет, реальный tx не открывается`() {
         val dryCtx = RunContext.test(dryRun = true)
-        with(dryCtx) {
+        with(handler(dryCtx)) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 91)
             }
@@ -283,7 +283,7 @@ class SqlOpsIntegrationTest {
         }
         // 1) Ни одна строка не записана
         val realCtx = RunContext.test()
-        val count = with(realCtx) {
+        val count = with(handler(realCtx)) {
             jdbc(db).query("select count(*) as c from orders where status in (91, 92)") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(0)
@@ -295,15 +295,15 @@ class SqlOpsIntegrationTest {
     @Test
     fun `batch update меняет множество строк`() {
         val ctx = RunContext.test(dryRun = false)
-        val ids = with(ctx) {
+        val ids = with(handler(ctx)) {
             jdbc(db).query("select id from orders") { it.getLong("id") }
         }
-        with(ctx) {
+        with(handler(ctx)) {
             jdbc(db).batch("update orders set status = ? where id = ?", ids) { ps, id ->
                 ps.setInt(1, 7); ps.setLong(2, id)
             }
         }
-        val after = with(ctx) {
+        val after = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders where status = 7") { it.getInt("c") }
         }.first()
         assertThat(after).isEqualTo(3)
@@ -313,7 +313,7 @@ class SqlOpsIntegrationTest {
     fun `stream проходит по всем строкам с fetchSize меньше total`() {
         val ctx = RunContext.test()
         val ids = mutableListOf<Long>()
-        with(ctx) {
+        with(handler(ctx)) {
             jdbc(db).stream(
                 "select id from orders order by id",
                 fetchSize = 1,                              // принудительно постраничный курсор
@@ -326,7 +326,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `stream возвращает значение из consume callback`() {
         val ctx = RunContext.test()
-        val sum = with(ctx) {
+        val sum = with(handler(ctx)) {
             jdbc(db).stream(
                 "select id from orders",
                 mapper = { it.getLong("id") },
@@ -339,7 +339,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `stream с named-параметрами фильтрует и валидирует placeholders`() {
         val ctx = RunContext.test()
-        val ids = with(ctx) {
+        val ids = with(handler(ctx)) {
             jdbc(db).stream(
                 "select id from orders where status = :s",
                 "s" to 1,
@@ -353,7 +353,7 @@ class SqlOpsIntegrationTest {
     fun `stream - missing parameter бросает IllegalArgumentException`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).stream(
                     "select id from orders where status = :s",
                     mapper = { it.getLong("id") },
@@ -368,7 +368,7 @@ class SqlOpsIntegrationTest {
     fun `stream - fetchSize не положительный бросает IllegalArgumentException`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).stream(
                     "select id from orders",
                     fetchSize = 0,
@@ -384,7 +384,7 @@ class SqlOpsIntegrationTest {
     fun `stream - exception в consume пробрасывается и connection корректно освобождается`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 jdbc(db).stream(
                     "select id from orders",
                     mapper = { it.getLong("id") },
@@ -398,7 +398,7 @@ class SqlOpsIntegrationTest {
         assertThat(ex!!.message).isEqualTo("abort")
 
         // Connection освобождён — следующая операция на БД работает.
-        val count = with(ctx) {
+        val count = with(handler(ctx)) {
             jdbc(db).query("select count(*) as c from orders") { it.getInt("c") }
         }.first()
         assertThat(count).isEqualTo(3)
@@ -407,7 +407,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `stream внутри transactional видит uncommitted insert`() {
         val ctx = RunContext.test()
-        val visible = with(ctx) {
+        val visible = with(handler(ctx)) {
             transactional(jdbc(db)) {
                 execute("insert into orders(status) values (:s)", "s" to 88)
                 stream(
@@ -421,7 +421,7 @@ class SqlOpsIntegrationTest {
     @Test
     fun `stream - sequence невалидна после возврата из consume`() {
         val ctx = RunContext.test()
-        val leaked: Sequence<Long> = with(ctx) {
+        val leaked: Sequence<Long> = with(handler(ctx)) {
             jdbc(db).stream(
                 "select id from orders",
                 mapper = { it.getLong("id") },
