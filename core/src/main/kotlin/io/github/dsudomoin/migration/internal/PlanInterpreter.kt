@@ -18,6 +18,7 @@ import java.util.concurrent.CompletionStage
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -201,15 +202,26 @@ class PlanInterpreter(
                     failures += e
                     break
                 }
-                base.executor.execute {
-                    try {
-                        processItem(policy, scope, handle, item, skipped, threshold)
-                        ticker.tick()
-                    } catch (e: Throwable) {
-                        failures += e
-                    } finally {
-                        permits.release()
+                // Одно взятое разрешение — ровно одно возвращённое, кем бы оно ни было возвращено.
+                // Если executor отверг задачу, воркера не будет, и без явного release внешний
+                // acquire(parallel) ждал бы разрешения, которое уже некому отпустить.
+                val released = AtomicBoolean(false)
+                val releasePermit = { if (released.compareAndSet(false, true)) permits.release() }
+                try {
+                    base.executor.execute {
+                        try {
+                            processItem(policy, scope, handle, item, skipped, threshold)
+                            ticker.tick()
+                        } catch (e: Throwable) {
+                            failures += e
+                        } finally {
+                            releasePermit()
+                        }
                     }
+                } catch (e: Throwable) {
+                    releasePermit()
+                    failures += e
+                    break
                 }
             }
         } finally {
