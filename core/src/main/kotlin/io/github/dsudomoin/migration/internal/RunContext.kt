@@ -10,10 +10,8 @@ import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executor
 import java.util.concurrent.ForkJoinPool
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Стандартная реализация [RunScope]. Создаётся только через фабрики на companion-объекте:
@@ -36,9 +34,13 @@ class RunContext internal constructor(
     val defaultParallel: Int = 1,
 ) : RunScope {
 
-    private val resources = ConcurrentLinkedDeque<AutoCloseable>()
+    // Флаг и очередь меняются под одним монитором: раздельные ConcurrentLinkedDeque и AtomicBoolean
+    // позволяли закрытию целиком уложиться между чтением флага и добавлением в очередь, и такой
+    // ресурс не закрывался никогда.
+    private val stateLock = Any()
+    private val resources = ArrayDeque<AutoCloseable>()
     private val sharedResources = ConcurrentHashMap<Any, AutoCloseable>()
-    private val closed = AtomicBoolean(false)
+    private var closed = false
 
     override fun <R> guardWrite(label: String, args: Map<String, Any?>, dryRunDefault: R, action: () -> R): R {
         if (dryRun) {
@@ -61,38 +63,48 @@ class RunContext internal constructor(
     override fun <T : AutoCloseable> shared(key: Any, factory: () -> T): T {
         // После закрытия реестра не кэшируем: register ниже закроет созданное сразу, и класть
         // закрытый объект в мапу как «общий на прогон» было бы враньём.
-        if (closed.get()) {
+        if (isClosed()) {
             val late = factory()
             register(late)
             return late
         }
         val created = sharedResources.computeIfAbsent(key) { factory().also { register(it) } }
+        // Реестр мог закрыться, пока работала фабрика: тогда register уже закрыл объект, и держать
+        // его в кэше нельзя — следующий вызов обязан получить свежий, а не мёртвый.
+        if (isClosed()) sharedResources.remove(key, created)
         @Suppress("UNCHECKED_CAST")
         return created as T
     }
 
     override fun register(c: AutoCloseable) {
-        if (closed.get()) {
-            closeOne(c, "late-registered ")
-            return
+        val closeNow = synchronized(stateLock) {
+            if (closed) true else { resources.addFirst(c); false }
         }
-        resources.addFirst(c)
+        // Закрываем вне монитора: close() может сам обратиться к реестру, и держать лок на время
+        // пользовательского кода незачем.
+        if (closeNow) closeOne(c, "late-registered ")
     }
 
     /**
      * Закрыть все зарегистрированные ресурсы в обратном порядке регистрации. Идемпотентно
      * (повторный вызов — no-op). Исключения от `close()` не пробрасываются: логируются WARN'ом
      * + добавляются в `report.warnings`. Вызывается runner'ом в `finally` после исполнения плана.
+     *
+     * Снимок очереди берётся одним действием вместе с установкой флага: иначе ресурс, добавленный
+     * между обходом и очисткой, не закрылся бы никогда. Всё, что зарегистрируют после этого,
+     * закроет сам [register].
      */
     fun closeRegistered() {
-        if (!closed.compareAndSet(false, true)) return
-        val iter = resources.iterator()
-        while (iter.hasNext()) {
-            closeOne(iter.next(), "")
+        val snapshot = synchronized(stateLock) {
+            if (closed) return
+            closed = true
+            resources.toList().also { resources.clear() }
         }
-        resources.clear()
         sharedResources.clear()
+        snapshot.forEach { closeOne(it, "") }
     }
+
+    private fun isClosed(): Boolean = synchronized(stateLock) { closed }
 
     private fun closeOne(c: AutoCloseable, prefix: String) {
         try {
@@ -152,7 +164,7 @@ class RunContext internal constructor(
          * Низкоуровневая фабрика — принимает все зависимости явно. Используется в трёх местах:
          *
          * - [io.github.dsudomoin.migration.kora.MigrationRunner] в боевом сценарии (главный потребитель);
-         * - тесты, которым нужны кастомный `Executor` / `ErrorReporter` (см. `ForEachTest.customCtx`);
+         * - тесты, которым нужны кастомный `Executor` / `ErrorReporter` (см. `ParallelStageTest.ctx`);
          * - пользовательский код, который хочет нестандартный `ErrorReporter` (Sentry, Kibana,
          *   JSON Lines) — на уровне приложения, см. `docs/examples/customization.md`.
          *
