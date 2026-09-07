@@ -302,7 +302,8 @@ class SampleMigration(
         }
 
         scoped(
-            parents = { resolve(origins).asSequence() },
+            origins,
+            parents = { loaded -> loaded.asSequence() },
             completionTimeout = config.completionTimeout(),
             parallel = config.parallel(),
             onItemError = ItemError.Skip,

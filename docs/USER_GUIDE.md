@@ -272,8 +272,9 @@ override fun plan() = migration(name = name, author = "team") {
     }
 
     scoped(
+        shards,
         name = "resend",
-        parents = { resolve(shards).asSequence() },
+        parents = { loaded -> loaded.asSequence() },
         items = { shard -> shardItems(shard) },
     ) { item ->
         publish("items.resync", mapOf("id" to item.id)) { send(item) }
@@ -377,7 +378,7 @@ op-обёрток ([§28](#28-шпаргалка-faq)).
 
 | Член | Что |
 |---|---|
-| `resolve(input)` | значение `Input<I>`: вычисляется при первом обращении и кэшируется на весь прогон |
+| `resolve(input)` | значение `Input<I>`: вычисляется при первом обращении и кэшируется на весь прогон. Обычно не нужен — объяви зависимость параметром стадии ([§12](#12-input-и-validate--конфиг-прогона)) |
 | `pages(first, next, nextCursor, continueWhen)` | ленивый курсорный источник ([§8](#8-pages--курсорная-пагинация)) |
 | `scopedResource { close }` | закрытие на **границе текущего scope'а**: в `scoped` — на границе родителя, а не в конце прогона |
 
@@ -535,8 +536,9 @@ override fun plan() = migration(name = name, author = "team") {
     val report = output("resent.csv", "strategy", "position", "version")
 
     scoped(
+        strategies,
         name = "resend-by-strategy",
-        parents = { resolve(strategies).asSequence() },
+        parents = { loaded -> loaded.asSequence() },
         completionTimeout = Duration.ofMinutes(10),
         parallel = 8,
         onItemError = ItemError.Skip,
@@ -865,6 +867,11 @@ Item-level retry в DSL **нет**. Правильные места:
 
 ```kotlin
 fun <I> input(name: String, load: InputScope.() -> I): Input<I>
+
+// зависимость объявляется в сигнатуре узла, значение приезжает параметром
+source(input, items = { loaded -> … }) { … }
+source(input1, input2, items = { a, b -> … }) { … }
+scoped(input, parents = { loaded -> … }, items = { parent -> … }) { … }
 ```
 
 `Input<I>` — ленивая ссылка. Значение вычисляется при **первом** `resolve` и кэшируется на весь
@@ -876,16 +883,20 @@ override fun plan() = migration(name = name, author = "team") {
         jdbc(db).query("select id from shards where active") { it.getLong("id") }
     }
 
-    source(name = "warm", items = { resolve(shards).asSequence() }) { shard -> ... }
+    source(shards, name = "warm", items = { loaded -> loaded.asSequence() }) { shard -> ... }
 
     scoped(
+        shards,                                          // тот же список, повторного запроса нет
         name = "process",
-        parents = { resolve(shards).asSequence() },     // тот же список, повторного запроса нет
+        parents = { loaded -> loaded.asSequence() },
         items = { shard -> itemsOf(shard) },
     ) { item -> ... }
 }
 ```
 
+- зависимость объявляй параметром стадии — тогда её видно по сигнатуре узла, не открывая тело;
+- `resolve(input)` остаётся для случаев, которые параметром не выражаются: третья зависимость
+  или `scoped`, где тот же input нужен ещё и в `items` (вернётся тот же закэшированный объект);
 - `resolve` доступен **только** в `items` / `parents` (`SourceScope`).
 - Идентичность — сам объект `Input`, а не имя: план неизменяем, и повторное исполнение того же
   плана не получит кэш прошлого прогона.

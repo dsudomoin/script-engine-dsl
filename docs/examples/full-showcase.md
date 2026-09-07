@@ -377,8 +377,9 @@ class SampleMigration(
         }
 
         scoped(
+            segments,
             name = "resync",
-            parents = { resolve(segments).keys.asSequence() },
+            parents = { loaded -> loaded.keys.asSequence() },
             completionTimeout = config.completionTimeout(),
             parallel = config.parallel(),
             errorThreshold = 100,               // на сегмент; сбрасывается на его границе
@@ -397,6 +398,8 @@ class SampleMigration(
                 errors.includeItem<Customer> { "id=${it.id}, status=${it.status}, balance=${it.balance}" }
                 errors.includeItem<List<String>> { "batch of ${it.size}, first=${it.firstOrNull()}" }
 
+                // тот же input нужен и элементам, а параметром он приходит только в parents —
+                // resolve вернёт тот же закэшированный объект, второго запроса не будет
                 resolve(segments).getValue(segment).asSequence().chunked(config.batchSize())
             },
         ) { batch ->
@@ -597,8 +600,9 @@ thread-safe. Вне прогона хендл бросает `IllegalStateExcept
 
 ```kotlin
 scoped(
+    segments,
     name = "resync",
-    parents = { resolve(segments).keys.asSequence() },
+    parents = { loaded -> loaded.keys.asSequence() },
     completionTimeout = config.completionTimeout(),
     parallel = config.parallel(),
     errorThreshold = 100,
@@ -937,7 +941,8 @@ resilient.retry.syncApi {
 
 ```kotlin
 scoped(
-    parents = { resolve(segments).asSequence() },
+    segments,
+    parents = { loaded -> loaded.asSequence() },
     items = { segment ->
         val cursor = legacyStore.openCursor(segment)   // держит соединение
         scopedResource { cursor.close() }              // закроется на границе ЭТОГО сегмента
