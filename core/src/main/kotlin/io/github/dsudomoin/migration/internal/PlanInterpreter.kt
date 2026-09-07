@@ -7,17 +7,20 @@ import io.github.dsudomoin.migration.InputScope
 import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.Progress
 import io.github.dsudomoin.migration.MigrationPlan
+import io.github.dsudomoin.migration.OutputHandle
 import io.github.dsudomoin.migration.RunScope
 import io.github.dsudomoin.migration.SourceScope
 import io.github.dsudomoin.migration.Stage
 import io.github.dsudomoin.migration.WriteOutcome
 import io.github.dsudomoin.migration.WriteResult
+import io.github.dsudomoin.migration.csv.CsvOutput
 import io.github.dsudomoin.migration.csv.openCsv
 import java.time.Duration
 import java.util.concurrent.CompletionStage
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -33,30 +36,43 @@ class PlanInterpreter(
     private val progressSink: (String) -> Unit = { base.log.info(it) },
 ) {
 
-    private val inputs = ConcurrentHashMap<Input<*>, Any?>()
+    private val inputs = ConcurrentHashMap<Input<*>, ResolvedInput>()
 
     fun execute(plan: MigrationPlan) {
-        val outputs = plan.outputs.map { handle ->
-            val csv = base.openCsv(handle.filename, *handle.headers.toTypedArray())
-            handle.bind(csv)
-            handle to csv
-        }
+        val outputs = mutableListOf<Pair<OutputHandle, CsvOutput>>()
 
         try {
+            // Открытие внутри try: если второй выход не открылся, первый обязан быть закрыт и
+            // отвязан. Иначе он остаётся привязанным к writer'у, который позже закроет реестр
+            // прогона, и повторное исполнение того же плана пишет в мёртвый файл.
+            for (handle in plan.outputs) {
+                val csv = base.openCsv(handle.filename, *handle.headers.toTypedArray())
+                handle.bind(csv)
+                outputs += handle to csv
+            }
+
             plan.validation?.let { check ->
                 StageScope(base, CompletionTracker(), inputs).check()
             }
 
-            for (stage in plan.stages) {
-                when (stage) {
-                    is Stage.Flat<*> -> runFlat(stage)
-                    is Stage.Scoped<*, *> -> runScoped(stage)
+            plan.stages.forEachIndexed { index, stage ->
+                // Узел плана и есть фаза. Имя обязательно, когда стадий больше одной (проверяет
+                // билдер); у единственной неявной фазы оно нужно лишь как ключ и в отчёт не идёт.
+                base.report.beginPhase(stage.name ?: "phase-${index + 1}")
+                try {
+                    when (stage) {
+                        is Stage.Flat<*> -> runFlat(stage)
+                        is Stage.Scoped<*, *> -> runScoped(stage)
+                    }
+                } finally {
+                    base.report.endPhase()
                 }
             }
         } finally {
-            // Закрываем сами: реестр прогона сделает это повторно и идемпотентно, зато строки гарантированно
-            // оказываются на диске к моменту, когда прогон считается завершённым.
-            outputs.forEach { (handle, csv) ->
+            // Закрываем сами и в обратном порядке: реестр прогона сделает это повторно и идемпотентно,
+            // зато строки гарантированно оказываются на диске к моменту, когда прогон считается
+            // завершённым.
+            outputs.asReversed().forEach { (handle, csv) ->
                 try {
                     csv.close()
                 } catch (e: Throwable) {
@@ -120,6 +136,12 @@ class PlanInterpreter(
             tracker.sealAndAwait(timeout)
         } catch (barrierError: Throwable) {
             failure = failure?.also { it.addSuppressed(barrierError) } ?: barrierError
+        }
+
+        // Итоги снимаются ПОСЛЕ закрытия ресурсов: закрывающийся ресурс может попытаться дослать
+        // «хвост», и такая поздняя регистрация обязана попасть в отчёт именно этого scope'а.
+        try {
+            closeScopedResources(scope)
         } finally {
             base.report.addBarrierOutcome(
                 acked = tracker.acked,
@@ -127,9 +149,10 @@ class PlanInterpreter(
                 abandoned = tracker.abandoned,
                 late = tracker.lateRegistered,
             )
+            tracker.callbackFailures.forEach {
+                base.report.addWarning("effect audit failed: ${it.javaClass.simpleName}: ${it.message ?: ""}")
+            }
         }
-
-        closeScopedResources(scope)
 
         failure?.let { throw it }
     }
@@ -194,15 +217,26 @@ class PlanInterpreter(
                     failures += e
                     break
                 }
-                base.executor.execute {
-                    try {
-                        processItem(policy, scope, handle, item, skipped, threshold)
-                        ticker.tick()
-                    } catch (e: Throwable) {
-                        failures += e
-                    } finally {
-                        permits.release()
+                // Одно взятое разрешение — ровно одно возвращённое, кем бы оно ни было возвращено.
+                // Если executor отверг задачу, воркера не будет, и без явного release внешний
+                // acquire(parallel) ждал бы разрешения, которое уже некому отпустить.
+                val released = AtomicBoolean(false)
+                val releasePermit = { if (released.compareAndSet(false, true)) permits.release() }
+                try {
+                    base.executor.execute {
+                        try {
+                            processItem(policy, scope, handle, item, skipped, threshold)
+                            ticker.tick()
+                        } catch (e: Throwable) {
+                            failures += e
+                        } finally {
+                            releasePermit()
+                        }
                     }
+                } catch (e: Throwable) {
+                    releasePermit()
+                    failures += e
+                    break
                 }
             }
         } finally {
@@ -255,10 +289,19 @@ class PlanInterpreter(
         skipped: AtomicLong,
         threshold: Long,
     ) {
-        val decision = when (policy) {
-            is ItemError.Fail -> ItemError.Decision.Fail
-            is ItemError.Skip -> ItemError.Decision.Skip
-            is ItemError.Handle -> policy.decide(e, item)
+        val decision = try {
+            when (policy) {
+                is ItemError.Fail -> ItemError.Decision.Fail
+                is ItemError.Skip -> ItemError.Decision.Skip
+                is ItemError.Handle -> policy.decide(e, item)
+            }
+        } catch (classifierError: Throwable) {
+            // Сбой классификатора не имеет права проглотить отказ элемента: исходная ошибка уходит
+            // в suppressed, элемент всё равно аудитится, и оба конца видны в errors.csv.
+            classifierError.addSuppressed(e)
+            safeAudit(classifierError, item)
+            base.report.incFailed()
+            throw classifierError
         }
         safeAudit(e, item)
         when (decision) {
@@ -304,13 +347,22 @@ class PlanInterpreter(
 }
 
 /**
+ * Разрешённое значение input'а.
+ *
+ * Обёртка, а не сырое значение: `ConcurrentHashMap` не хранит `null`, и `computeIfAbsent` на
+ * input'е со значением `null` не создавал бы mapping — загрузчик вызывался бы на каждый `resolve`.
+ * Исключение загрузчика mapping не создаёт и здесь, поэтому неудача не кэшируется как успешный `null`.
+ */
+internal class ResolvedInput(val value: Any?)
+
+/**
  * Контекст одного scope'а. Реализует все три пользовательских scope'а сразу: разделяются они только
  * типами на границе DSL, а во время исполнения это одно и то же состояние.
  */
 internal class StageScope(
     private val base: RunContext,
     private val tracker: CompletionTracker,
-    private val inputs: ConcurrentHashMap<Input<*>, Any?>,
+    private val inputs: ConcurrentHashMap<Input<*>, ResolvedInput>,
 ) : SourceScope, HandlerScope, InputScope, RunScope by base {
 
     // Обрабатываемый элемент нужен для контекста отказа, а воркеров у стадии может быть несколько.
@@ -320,7 +372,7 @@ internal class StageScope(
 
     @Suppress("UNCHECKED_CAST")
     override fun <I> resolve(input: Input<I>): I =
-        inputs.computeIfAbsent(input) { input.load(this) } as I
+        inputs.computeIfAbsent(input) { ResolvedInput(input.load(this)) }.value as I
 
     override fun <C : Any, T> pages(
         name: String?,

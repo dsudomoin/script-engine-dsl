@@ -1,5 +1,6 @@
 package io.github.dsudomoin.migration.kora.ops
 
+import io.github.dsudomoin.migration.HandlerScope
 import io.github.dsudomoin.migration.RunScope
 import org.apache.kafka.clients.producer.Producer
 import org.apache.kafka.clients.producer.ProducerRecord
@@ -98,7 +99,7 @@ class KafkaOps<K, V> internal constructor(
  * Фабрика [KafkaOps] — для ad-hoc публикаций без `topic`-handle. Инстанс мемоизируется на
  * `Producer` в пределах прогона, поэтому вызов внутри обработчика не плодит объекты.
  */
-fun <K, V> RunScope.kafka(producer: Producer<K, V>): KafkaOps<K, V> =
+fun <K, V> HandlerScope.kafka(producer: Producer<K, V>): KafkaOps<K, V> =
     shared(producer) { KafkaOps(this, producer) }
 
 /**
@@ -140,8 +141,14 @@ class KafkaTopic<K, V> internal constructor(
  * контексте — runner закроет (с flush'ем) после исполнения плана. Повторный вызов с теми же
  * аргументами (в том числе прямо в обработчике) отдаёт тот же объект.
  */
-fun <K, V> RunScope.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V> =
-    shared(TopicKey(producer, name)) { KafkaTopic(kafka(producer), name) }
+fun <K, V> HandlerScope.topic(producer: Producer<K, V>, name: String): KafkaTopic<K, V> {
+    // KafkaOps резолвится ДО входа в shared, а не внутри его фабрики. Оба вызова идут в один и тот
+    // же ConcurrentHashMap, и вложенный computeIfAbsent — это IllegalStateException("Recursive
+    // update"). Срабатывает он по совпадению бина, то есть недетерминированно от запуска к запуску:
+    // identity hash code продюсера каждый раз новый.
+    val ops = kafka(producer)
+    return shared(TopicKey(producer, name)) { KafkaTopic(ops, name) }
+}
 
 /** Ключ мемоизации [topic]: идентичность продюсера плюс имя топика. */
 private data class TopicKey(val producer: Producer<*, *>, val name: String)

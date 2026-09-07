@@ -47,7 +47,7 @@ class KafkaOpsIntegrationTest {
         val topic = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test()
 
-        with(ctx) { kafka(producer).publish(topic, "k1", "v1") }
+        with(handler(ctx)) { kafka(producer).publish(topic, "k1", "v1") }
 
         val received = consumeOne(topic)
         assertThat(received).isEqualTo("k1" to "v1")
@@ -58,7 +58,7 @@ class KafkaOpsIntegrationTest {
         val topic = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test(dryRun = true)
 
-        with(ctx) { kafka(producer).publish(topic, "k-dry", "v-dry") }
+        with(handler(ctx)) { kafka(producer).publish(topic, "k-dry", "v-dry") }
 
         val received = consumeOneOrNull(topic, Duration.ofSeconds(3))
         assertThat(received).isNull()
@@ -69,7 +69,7 @@ class KafkaOpsIntegrationTest {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test()
 
-        with(ctx) {
+        with(handler(ctx)) {
             val t = topic(producer, topicName)
             t.send("k1", "v1")
         }
@@ -84,7 +84,7 @@ class KafkaOpsIntegrationTest {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test()
 
-        with(ctx) {
+        with(handler(ctx)) {
             val t = topic(producer, topicName)
             t.send("k1", "v1")
             t.send("k2", "v2")
@@ -101,7 +101,7 @@ class KafkaOpsIntegrationTest {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test(dryRun = true)
 
-        with(ctx) {
+        with(handler(ctx)) {
             val t = topic(producer, topicName)
             t.send("k-dry", "v-dry")
         }
@@ -115,7 +115,7 @@ class KafkaOpsIntegrationTest {
     fun `topic - close идемпотентен`() {
         val topicName = "t-" + UUID.randomUUID().toString().take(8)
         val ctx = RunContext.test()
-        val t = with(ctx) { topic(producer, topicName) }
+        val t = with(handler(ctx)) { topic(producer, topicName) }
         t.send("k1", "v1")
 
         t.close()

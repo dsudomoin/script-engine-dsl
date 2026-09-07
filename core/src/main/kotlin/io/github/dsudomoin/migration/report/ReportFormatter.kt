@@ -85,6 +85,31 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
             "  $dr Dry-run skipped writes:    ($breakdown)\n"
         } else ""
 
+        val unhandledLine = if (r.unhandledFailures > 0) {
+            "  $fl Unhandled failures:      ${fmt(r.unhandledFailures)}\n"
+        } else ""
+
+        // Секция появляется только у реально многофазной миграции: у единственной неявной фазы
+        // её числа дословно совпадают с итогами прогона выше.
+        val phasesBlock = if (r.phases.isEmpty()) "" else buildString {
+            append("$mid\n")
+            append("Phases:\n")
+            r.phases.forEach { p ->
+                append("  ${p.name}\n")
+                append("    processed ${fmt(p.processed)}, ok ${fmt(p.successful)}, ")
+                append("skipped ${fmt(p.skipped)}, failed ${fmt(p.failed)}\n")
+                if (p.sourceSkipped > 0) append("    source rows dropped ${fmt(p.sourceSkipped)}\n")
+                if (p.appliedWrites.isNotEmpty()) append("    applied ${breakdown(p.appliedWrites)}\n")
+                if (p.rejectedWrites.isNotEmpty()) append("    rejected ${breakdown(p.rejectedWrites)}\n")
+                if (p.dryRunSkipped.isNotEmpty()) append("    dry-run skipped ${breakdown(p.dryRunSkipped)}\n")
+                if (p.acknowledgedPublishes > 0) append("    acked ${fmt(p.acknowledgedPublishes)}\n")
+                if (p.failedEffects > 0) append("    failed effects ${fmt(p.failedEffects)}\n")
+                if (p.abandonedPublishes > 0) append("    abandoned ${fmt(p.abandonedPublishes)}\n")
+                if (p.lateRegistered > 0) append("    late registered ${fmt(p.lateRegistered)}\n")
+                if (p.rawPages > 0) append("    read ${fmt(p.rawRows)} row(s) in ${fmt(p.rawPages)} page(s)\n")
+            }
+        }
+
         val mode = if (r.dryRun) "DRY-RUN" else "REAL"
 
         return buildString {
@@ -99,6 +124,7 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
             append("  $ok Successful:            ${fmt(r.successful)}\n")
             append("  $sk Skipped (errors):      ${fmt(r.skipped)}\n")
             append("  $fl Failed:                ${fmt(r.failed)}\n")
+            append(unhandledLine)
             append(appliedLine)
             append(rejectedLine)
             append(ackedLine)
@@ -108,6 +134,7 @@ class ReportFormatter(private val asciiOnly: Boolean = false) {
             append(rawLine)
             append(warningsBlock)
             append(dryLine)
+            append(phasesBlock)
             append("$mid\n")
             if (r.errorsFile != null) append("Error details:  ${r.errorsFile}\n")
             if (r.tracesFile != null) append("Error traces:   ${r.tracesFile}\n")

@@ -2,6 +2,7 @@ package io.github.dsudomoin.migration.kora.ops
 
 import com.datastax.oss.driver.api.core.CqlSession
 import com.datastax.oss.driver.api.core.cql.*
+import io.github.dsudomoin.migration.HandlerScope
 import io.github.dsudomoin.migration.RunScope
 
 /**
@@ -21,11 +22,11 @@ import io.github.dsudomoin.migration.RunScope
  * `session.prepare(sameCql)` отдаёт тот же `PreparedStatement` из driver-cache. Дополнительный
  * слой здесь не нужен.
  */
-class CassandraOps internal constructor(
-    private val ctx: RunScope,
-    private val session: CqlSession,
+open class CassandraReadOps internal constructor(
+    protected val ctx: RunScope,
+    protected val session: CqlSession,
 ) {
-    private fun prepared(cql: String): PreparedStatement = session.prepare(cql)
+    protected fun prepared(cql: String): PreparedStatement = session.prepare(cql)
 
     /**
      * Полное чтение результата в `List<T>`.
@@ -37,29 +38,7 @@ class CassandraOps internal constructor(
     fun <T> query(cql: String, vararg params: Pair<String, Any?>, mapper: (Row) -> T): List<T> =
         session.execute(bind(cql, params)).map(mapper).toList()
 
-    /** `INSERT/UPDATE/DELETE` (Cassandra: CRUD-семантика немного другая, но guardWrite те же). */
-    fun execute(cql: String, vararg params: Pair<String, Any?>): ResultSet? =
-        ctx.guardWrite("cassandra.execute", mapOf("cql" to cql.take(80)), dryRunDefault = null) {
-            session.execute(bind(cql, params))
-        }
-
-    /**
-     * Bulk-execute через prepared statement. Каждый item вызывается на свой `boundStatementBuilder`,
-     * биндинг через [binder]. NB: Cassandra не имеет true batch'а в JDBC-смысле — это просто цикл
-     * `session.execute(...)` по подготовленному statement.
-     */
-    fun <T> batch(cql: String, items: Iterable<T>, binder: (BoundStatementBuilder, T) -> Unit) {
-        ctx.guardWrite("cassandra.batch", mapOf("cql" to cql.take(80))) {
-            val ps = prepared(cql)
-            for (item in items) {
-                val b = ps.boundStatementBuilder()
-                binder(b, item)
-                session.execute(b.build())
-            }
-        }
-    }
-
-    private fun bind(cql: String, params: Array<out Pair<String, Any?>>): Statement<*> {
+    protected fun bind(cql: String, params: Array<out Pair<String, Any?>>): Statement<*> {
         val ps = prepared(cql)
         val bb = ps.boundStatementBuilder()
         for ((k, v) in params) setExplicit(bb, k, v)
@@ -121,4 +100,43 @@ class CassandraOps internal constructor(
  * Фабрика [CassandraOps]. Для multi-кластерной миграции — два разных `CqlSession` через
  * `@Tag(...)` и `cassandra(primary)`, `cassandra(replica)`.
  */
-fun RunScope.cassandra(session: CqlSession): CassandraOps = CassandraOps(this, session)
+/**
+ * Cassandra-операции с записью: [CassandraOps.execute], [CassandraOps.batch] и всё чтение из
+ * [CassandraReadOps].
+ *
+ * Доступна только из обработчика элемента: внешнее изменение обязано иметь границу элемента и
+ * попадать в учёт эффектов, а источник по определению описывает данные, а не меняет их.
+ */
+class CassandraOps internal constructor(
+    ctx: RunScope,
+    session: CqlSession,
+) : CassandraReadOps(ctx, session) {
+
+    /** `INSERT/UPDATE/DELETE` (Cassandra: CRUD-семантика немного другая, но guardWrite те же). */
+    fun execute(cql: String, vararg params: Pair<String, Any?>): ResultSet? =
+        ctx.guardWrite("cassandra.execute", mapOf("cql" to cql.take(80)), dryRunDefault = null) {
+            session.execute(bind(cql, params))
+        }
+
+    /**
+     * Bulk-execute через prepared statement. Каждый item вызывается на свой `boundStatementBuilder`,
+     * биндинг через [binder]. NB: Cassandra не имеет true batch'а в JDBC-смысле — это просто цикл
+     * `session.execute(...)` по подготовленному statement.
+     */
+    fun <T> batch(cql: String, items: Iterable<T>, binder: (BoundStatementBuilder, T) -> Unit) {
+        ctx.guardWrite("cassandra.batch", mapOf("cql" to cql.take(80))) {
+            val ps = prepared(cql)
+            for (item in items) {
+                val b = ps.boundStatementBuilder()
+                binder(b, item)
+                session.execute(b.build())
+            }
+        }
+    }
+}
+
+/** Чтение из Cassandra — доступно в любом scope'е прогона. */
+fun RunScope.cassandra(session: CqlSession): CassandraReadOps = CassandraReadOps(this, session)
+
+/** Чтение и запись — только в обработчике элемента. */
+fun HandlerScope.cassandra(session: CqlSession): CassandraOps = CassandraOps(this, session)

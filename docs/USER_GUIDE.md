@@ -341,9 +341,26 @@ interface HandlerScope : RunScope         // тело обработчика
 | `guardWrite(label, args) { }` | — | низкоуровневый dry-run-гейт; нужен только авторам своих операций |
 | `auditError(e, item)` | — | ручная запись в `errors.csv`; в обычной жизни не нужна |
 
-Все операции (`jdbc`, `transactional`, `cassandra`, `kafka`, `topic`, `http`, `readCsv`,
-`openCsv`) — extension-функции на `RunScope`. Поэтому читать из базы можно и в `items`, и в
-обработчике, и в `validate`.
+Операции разделены по scope'ам: **чтение** объявлено на `RunScope` и доступно везде,
+**запись** — на `HandlerScope`, то есть только в обработчике элемента. Источник описывает данные,
+а не меняет внешний мир, и следит за этим компилятор: `jdbc(db).execute(...)` внутри `items { }`
+не компилируется.
+
+| Операция | `input` / `validate` / `parents` / `items` | `handle` |
+|---|---|---|
+| `jdbc(db).query` / `.stream` | да | да |
+| `jdbc(db).execute` / `.batch` / `.executeReturning` | нет | да |
+| `transactional(ops) { }` | нет | да |
+| `cassandra(s).query` | да | да |
+| `cassandra(s).execute` / `.batch` | нет | да |
+| `http(call).get` | да | да |
+| `http(call).post` / `.put` / `.patch` / `.delete` | нет | да |
+| `kafka(p)` / `topic(p, name)` | нет | да |
+| `readCsv` / `openCsv` / `pages` | да | да |
+| `guardWrite` | да — низкоуровневый escape hatch, в гайдах не используется | да |
+
+`kafka` и `topic` переехали целиком: читающей половины у них нет, а raw `publishAsync` из
+источника вообще не доходил до барьера подтверждений.
 
 `shared(key) { factory }` — на нём построены `kafka(producer)` и `topic(producer, name)`:
 повторный вызов с тем же ключом отдаёт тот же объект. Именно поэтому их безопасно звать прямо в
@@ -794,9 +811,10 @@ source(
 Превышение бросает `ErrorThresholdExceeded` и обрывает прогон. Значение по умолчанию —
 `migration.defaults.errorThreshold` (`0` = выключено), аргумент стадии сильнее конфига.
 
-Дополнительно в конце прогона runner делает post-mortem проверку по суммарному `report.skipped`
-против `migration.defaults.errorThreshold` — она ловит случай, когда прогон дошёл до конца
-естественно, но суммарно по стадиям skip'ов накопилось больше порога.
+Модель ровно одна: порог принадлежит фазе и проверяется в реальном времени. Второй,
+post-mortem, проверки нет намеренно — она сравнивала суммарный `report.skipped` всего прогона с
+глобальным дефолтом и тем самым отменяла собственный `errorThreshold` стадии: одно имя означало
+две разные области действия.
 
 Строки, отброшенные при чтении источника (`readCsv(onRowError = Skip)`), в этот счётчик **не
 входят** — они считаются отдельно, как `sourceSkipped` ([§15](#15-чтение-csv--readcsv)).
@@ -1733,6 +1751,8 @@ Error traces:   logs/SAMPLE-001/errors.log
 | `✓ Acknowledged publishes` | подтверждённые на барьере эффекты | `publish` ([§10](#10-publish--асинхронная-отправка-и-барьер)) |
 | `✗ Failed effects` | эффекты, отказавшие на барьере | там же |
 | `⚠ Unconfirmed effects` | отправлено, но исход неизвестен: `(abandoned: N, late: M)` | таймаут барьера / поздняя регистрация |
+| `✗ Unhandled failures` | отказы стадии или прогона, у которых элемента могло не быть | ошибка источника, `validate`, барьера |
+| `Phases:` | по каждой фазе: processed / ok / skipped / failed, applied, acked, отказы | печатается только у многофазной миграции |
 | `⊘ Source rows dropped` | строки, отброшенные при чтении источника (битый CSV) | `readCsv(onRowError = Skip)` ([§15](#15-чтение-csv--readcsv)) |
 | `⌀ Source pages read` | сырые страницы и строки — «прочитано» до фильтров | `pages(...)` ([§8](#8-pages--курсорная-пагинация)) |
 | `⌀ Dry-run skipped writes` | разбивка пропущенных под репетицией записей | dry-run ([§21](#21-dry-run)) |
@@ -1797,10 +1817,10 @@ override fun plan() = migration(
 Аргумент по умолчанию `null` — тогда политику берут из `migration.defaults.onUnhandled` (из
 коробки `FAIL_FAST`). Заданный в коде аргумент сильнее конфига.
 
-- **`FAIL_FAST`** (дефолт) — залогировать, инкрементить `report.failed`, exit-code 1. Уместно
-  когда «не пишем дальше».
-- **`LOG_AND_COMPLETE`** — залогировать, инкрементить `report.failed`, **дойти до конца** (закрыть
-  ресурсы, напечатать отчёт), вернуть exit-code 0. Уместно для compliance-сценариев: хоть какой-то
+- **`FAIL_FAST`** (дефолт) — залогировать, инкрементить `report.unhandledFailures`, exit-code 1.
+  Уместно когда «не пишем дальше».
+- **`LOG_AND_COMPLETE`** — залогировать, инкрементить `report.unhandledFailures`, **дойти до
+  конца** (закрыть ресурсы, напечатать отчёт), вернуть exit-code 0. Уместно для compliance-сценариев: хоть какой-то
   отчёт нужнее, чем абортированный прогон.
 
 Чего `ScriptPolicy` **не** делает:
@@ -1809,8 +1829,10 @@ override fun plan() = migration(
   ([§11](#11-itemerror--политика-ошибок-элемента));
 - не позволяет продолжить следующие стадии: провал стадии всегда останавливает прогон, политика
   меняет только код возврата;
-- не отменяет подъём кода до `1` из-за неподтверждённых эффектов ([§27](#27-exit-коды)) —
-  потерянные сообщения не имеют права закончиться нулём.
+- не отменяет подъём кода до `1` из-за любого отказа эффекта — провалившегося, неподтверждённого
+  или зарегистрированного после барьера ([§27](#27-exit-коды)): потерянные сообщения не имеют
+  права закончиться нулём;
+- не отменяет подъём кода до `1` при прерывании прогона.
 
 ---
 
@@ -1939,11 +1961,13 @@ MIGRATION_RUN=CUSTOMER-TIER-001 MIGRATION_DRY_RUN=true ./gradlew :example:run # 
 | Код | Что значит |
 |---|---|
 | `0` | Success. Включая `LOG_AND_COMPLETE`-сценарии (ошибка была, но runner довёл прогон до конца). Без `migration.run` runner вообще не трогает код возврата: процесс живёт дальше по своим правилам. |
-| `1` | `FAIL_FAST` от ошибки, вышедшей за пределы стадии (провал стадии, `ScopeEffectsFailed`, `ScopeCompletionTimeout`, `CursorNotAdvancing`, `ErrorThresholdExceeded`, ошибка `validate`); post-mortem превышение `errorThreshold`; неподтверждённые эффекты (`abandonedPublishes + lateRegistered > 0`). |
-| `2` | Мисконфиг — прогон не начинался: неизвестное имя миграции; дубликат имён в графе; ошибка построения плана (`plan()` бросил); недопустимые значения конфига (`defaults.parallel <= 0`, `defaults.progressEvery <= 0`, `defaults.errorThreshold < 0`, `errorReporting.maxItemReprLength <= 0`); не удалось создать `outputFolder`. |
+| `1` | `FAIL_FAST` от ошибки, вышедшей за пределы стадии (провал стадии, `ScopeEffectsFailed`, `ScopeCompletionTimeout`, `CursorNotAdvancing`, `ErrorThresholdExceeded`, ошибка `validate`); **любой** отказ эффекта (`failedEffects + abandonedPublishes + lateRegistered > 0`); прерывание прогона. |
+| `2` | Мисконфиг — прогон не начинался: неизвестное имя миграции; дубликат имён в графе; расхождение `MigrationDefinition.name` и имени плана; ошибка построения плана (`plan()` бросил); недопустимые значения конфига (`defaults.parallel <= 0`, `defaults.progressEvery <= 0`, `defaults.errorThreshold < 0`, `errorReporting.maxItemReprLength <= 0`); не удалось создать `outputFolder`. |
 
-Неподтверждённые эффекты поднимают код **независимо от `ScriptPolicy`**: `LOG_AND_COMPLETE` не
-должен превращать потерянные сообщения в ноль.
+Отказ эффекта и прерывание поднимают код **независимо от `ScriptPolicy`**: `LOG_AND_COMPLETE`
+покрывает допустимые отказы скрипта, но не нарушенную гарантию доставки и не наполовину сделанную
+работу. Отдельной post-mortem проверки порога больше нет — порог принадлежит фазе и срабатывает в
+реальном времени.
 
 Прод-инфраструктура (CI/CD, K8s Job) должна читать exit-code и решать ретраить/алертить.
 
@@ -2065,7 +2089,8 @@ class S3Ops(
     override fun close() { /* если есть что закрывать */ }
 }
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops =
+// HandlerScope, а не RunScope: обёртка пишет, значит ей место в обработчике
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops =
     shared(client to bucket) { S3Ops(this, client, bucket) }
 ```
 

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class ResourceRegistryTest {
@@ -109,5 +110,71 @@ class ResourceRegistryTest {
         assertThat(warnings.first())
             .contains("late-registered")
             .contains("late fail")
+    }
+
+    @Test
+    fun `ресурс, зарегистрированный во время закрытия, всё равно закрывается`() {
+        val ctx = RunContext.test()
+        val lateClosed = AtomicBoolean(false)
+
+        // Закрытие соседа регистрирует новый ресурс — это тот же интерливинг, что и гонка
+        // register/closeRegistered, только детерминированный.
+        ctx.register(AutoCloseable { ctx.register(AutoCloseable { lateClosed.set(true) }) })
+        ctx.closeRegistered()
+
+        assertThat(lateClosed).describedAs("поздняя регистрация обязана закрыться немедленно").isTrue()
+    }
+
+    @Test
+    fun `shared не отдаёт из кэша закрытый ресурс`() {
+        val ctx = RunContext.test()
+        val created = AtomicInteger()
+        val factory = { created.incrementAndGet(); AutoCloseable { } }
+
+        ctx.register(AutoCloseable { ctx.shared("key", factory) })
+        ctx.closeRegistered()
+
+        ctx.shared("key", factory)
+        assertThat(created.get())
+            .describedAs("закрытый объект не должен остаться в кэше shared")
+            .isEqualTo(2)
+    }
+
+    @Test
+    fun `ни один ресурс не теряется при гонке регистрации и закрытия`() {
+        // Окно дефекта — между чтением флага closed и добавлением в очередь: закрытие,
+        // уложившееся целиком в этот промежуток, оставляло ресурс незакрытым навсегда.
+        // Детерминированного шва для него нет, поэтому бьём по окну многократно.
+        repeat(300) {
+            val ctx = RunContext.test()
+            val registered = AtomicInteger()
+            val closed = AtomicInteger()
+            val start = CountDownLatch(1)
+
+            val writers = (1..4).map {
+                Thread {
+                    start.await()
+                    repeat(25) {
+                        registered.incrementAndGet()
+                        ctx.register(AutoCloseable { closed.incrementAndGet() })
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+            val closer = Thread {
+                start.await()
+                ctx.closeRegistered()
+            }.apply { isDaemon = true; start() }
+
+            start.countDown()
+            writers.forEach { it.join(10_000) }
+            closer.join(10_000)
+            // Ресурсы, зарегистрированные уже после закрытия, закрываются немедленно; поэтому
+            // после схождения потоков закрытыми обязаны быть все до единого.
+            ctx.closeRegistered()
+
+            assertThat(closed.get())
+                .describedAs("итерация %s: зарегистрировано %s, закрыто %s", it, registered.get(), closed.get())
+                .isEqualTo(registered.get())
+        }
     }
 }

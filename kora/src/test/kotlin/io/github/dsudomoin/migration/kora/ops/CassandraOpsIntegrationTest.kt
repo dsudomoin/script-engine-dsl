@@ -50,7 +50,7 @@ class CassandraOpsIntegrationTest {
     @Test
     fun `query читает строки`() {
         val ctx = RunContext.test()
-        val ids = with(ctx) {
+        val ids = with(handler(ctx)) {
             cassandra(session).query("select id from t.items") { it.getString("id")!! }
         }
         assertThat(ids).containsExactlyInAnyOrder("a", "b", "c")
@@ -59,10 +59,10 @@ class CassandraOpsIntegrationTest {
     @Test
     fun `execute под dry-run не меняет таблицу`() {
         val dry = RunContext.test(dryRun = true)
-        with(dry) { cassandra(session).execute("update t.items set value = 99 where id = 'a'") }
+        with(handler(dry)) { cassandra(session).execute("update t.items set value = 99 where id = 'a'") }
 
         val real = RunContext.test()
-        val v = with(real) {
+        val v = with(handler(real)) {
             cassandra(session).query("select value from t.items where id = 'a'") { it.getInt("value") }
         }.first()
         assertThat(v).isEqualTo(1)
@@ -72,7 +72,7 @@ class CassandraOpsIntegrationTest {
     fun `query with IN ids - List bound через setList с inferred element class`() {
         val ctx = RunContext.test()
         val ids = listOf("a", "c")     // 'b' намеренно пропущен
-        val result = with(ctx) {
+        val result = with(handler(ctx)) {
             cassandra(session).query(
                 "select id, value from t.items where id in :ids",
                 "ids" to ids,
@@ -88,14 +88,14 @@ class CassandraOpsIntegrationTest {
         // в колонку типа set<text>.
         session.execute("create table if not exists t.tagged(id text primary key, tags set<text>)")
         val ctx = RunContext.test()
-        with(ctx) {
+        with(handler(ctx)) {
             cassandra(session).execute(
                 "insert into t.tagged(id, tags) values (:id, :tags)",
                 "id" to "row1",
                 "tags" to setOf("red", "green"),
             )
         }
-        val tags = with(ctx) {
+        val tags = with(handler(ctx)) {
             cassandra(session).query(
                 "select tags from t.tagged where id = :id",
                 "id" to "row1",
@@ -108,7 +108,7 @@ class CassandraOpsIntegrationTest {
     fun `query with IN - пустой List бросает IllegalArgumentException с понятной message`() {
         val ctx = RunContext.test()
         val ex = runCatching {
-            with(ctx) {
+            with(handler(ctx)) {
                 cassandra(session).query(
                     "select id from t.items where id in :ids",
                     "ids" to emptyList<String>(),
@@ -123,12 +123,12 @@ class CassandraOpsIntegrationTest {
     fun `batch insert - множество строк за раз`() {
         val real = RunContext.test()
         val items = listOf("d" to 4, "e" to 5)
-        with(real) {
+        with(handler(real)) {
             cassandra(session).batch("insert into t.items(id, value) values (:id, :v)", items) { b, it ->
                 b.setString("id", it.first); b.setInt("v", it.second)
             }
         }
-        val all = with(real) {
+        val all = with(handler(real)) {
             cassandra(session).query("select id from t.items") { it.getString("id")!! }
         }
         assertThat(all).contains("d", "e")

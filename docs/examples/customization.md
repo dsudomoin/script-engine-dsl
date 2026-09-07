@@ -7,10 +7,14 @@ DSL — это набор extension-функций на `RunScope` плюс не
 `@Tag(MigrationExecutor)`, `MigrationExit`). Если из коробки чего-то не хватает —
 добавляй своё, не дожидаясь патча либы.
 
-Все операции библиотеки (`jdbc`, `cassandra`, `kafka`, `topic`, `http`, `readCsv`,
-`openCsv`) — extension'ы именно на `RunScope`, а не на конкретный scope стадии. Поэтому
-твоя обёртка, написанная так же, автоматически работает во всех трёх контекстах: при
-загрузке `input`, при построении источника (`items = { }`) и в обработчике.
+Читающие операции библиотеки (`jdbc(db).query`, `cassandra(s).query`, `http(call).get`,
+`readCsv`, `openCsv`, `pages`) — extension'ы на `RunScope`, поэтому работают во всех трёх
+контекстах: при загрузке `input`, при построении источника (`items = { }`) и в обработчике.
+
+Пишущие (`jdbc(db).execute`, `cassandra(s).execute`, `http(call).post`, `kafka`, `topic`,
+`transactional`) объявлены на `HandlerScope` и доступны **только из обработчика**: внешнее
+изменение обязано иметь границу элемента и попадать в учёт эффектов. Пиши свою обёртку так же —
+читающую на `RunScope`, изменяющую на `HandlerScope`.
 
 Ниже — пять типичных сценариев кастомизации:
 
@@ -71,7 +75,8 @@ class S3Ops internal constructor(
             .contents().map { it.key() }
 }
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
+// HandlerScope, а не RunScope: у S3Ops есть put/delete, значит это пишущая обёртка
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
 ```
 
 Используется обычно:
@@ -157,7 +162,7 @@ class S3Ops internal constructor(
 /** Ключ мемоизации: идентичность клиента плюс имя бакета. */
 private data class S3Key(val client: S3Client, val bucket: String)
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops =
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops =
     shared(S3Key(client, bucket)) { S3Ops(this, client, bucket) }
 ```
 
@@ -196,7 +201,7 @@ publish("crm.notify", args = mapOf("customerId" to c.id)) {
 Если у него callback-API, заверни сам:
 
 ```kotlin
-fun RunScope.crm(client: CrmClient): CrmOps = shared(client) { CrmOps(client) }
+fun HandlerScope.crm(client: CrmClient): CrmOps = shared(client) { CrmOps(client) }
 
 class CrmOps internal constructor(private val client: CrmClient) : AutoCloseable {
 

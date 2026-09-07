@@ -1,25 +1,34 @@
 package io.github.dsudomoin.migration.kora.ops
 
+import io.github.dsudomoin.migration.HandlerScope
 import io.github.dsudomoin.migration.RunScope
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory
 import java.sql.Connection
 import java.sql.PreparedStatement
 import java.sql.ResultSet
 
+// Per-thread флаг «мы внутри transactional». Guard против вложенных
+// `transactional(outerOps) { transactional(outerOps) { ... } }` — без этого второй вызов проходил
+// бы по `ops.inTx == false`-branch и открывал бы вторую независимую tx. На уровне файла, а не
+// экземпляра: `jdbc(db)` каждый раз создаёт новый ops, а флаг обязан быть общим для всех на потоке.
+private val txInProgress: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
+
 /**
- * JDBC-операции миграции: `query/stream/execute/batch` поверх Kora [JdbcConnectionFactory].
+ * Читающая часть JDBC-операций: `query` и `stream` поверх Kora [JdbcConnectionFactory].
  *
- * Создаётся через [jdbc] на [RunScope]. В двух режимах:
- * - **Free** (вне [transactional]): каждый вызов `query/execute/batch` открывает свою
- *   транзакцию через `db.inTx`. Удобно для ad-hoc read'ов.
+ * Создаётся через [jdbc] на [RunScope] и потому доступна отовсюду: из `input`, `validate`,
+ * источника стадии и обработчика. Пишущая часть вынесена в [SqlOps] и доступна только из
+ * [HandlerScope] — внешнее изменение обязано иметь границу элемента и попадать в учёт эффектов,
+ * а источник по определению описывает данные, а не меняет их.
+ *
+ * В двух режимах:
+ * - **Free** (вне [transactional]): каждый вызов открывает свою транзакцию через `db.inTx`.
  * - **Tx-bound** (внутри [transactional]): все вызовы переиспользуют один [Connection],
  *   `commit` на успешном выходе из блока, `rollback` на исключении.
- *
- * Write-операции (`execute`, `batch`) идут через `guardWrite` — под dry-run пропускаются.
  */
-class SqlOps internal constructor(
-    private val ctx: RunScope,
-    private val db: JdbcConnectionFactory,
+open class SqlReadOps internal constructor(
+    protected val ctx: RunScope,
+    protected val db: JdbcConnectionFactory,
     private val txConn: Connection?,
     internal val inTx: Boolean,
 ) {
@@ -122,117 +131,7 @@ class SqlOps internal constructor(
         }
     }
 
-    /**
-     * `INSERT`/`UPDATE`/`DELETE`. Возвращает число затронутых строк. Под dry-run — возвращает
-     * `0`, в лог `INFO [DRY-RUN] jdbc.execute (sql=...)`.
-     */
-    fun execute(sql: String, vararg params: Pair<String, Any?>): Int {
-        val (rendered, values) = validateAndRender(sql, params)
-        return ctx.guardWrite("jdbc.execute", mapOf("sql" to sql.take(80)), dryRunDefault = 0) {
-            withConn { conn ->
-                conn.prepareStatement(rendered).use { ps ->
-                    bindValues(ps, values)
-                    ps.executeUpdate()
-                }
-            }
-        }
-    }
-
-    /**
-     * `INSERT ... VALUES (...)` batch с executeBatch. Параметры — позиционные `?`, биндинг
-     * через [binder]:
-     * ```
-     * jdbc(db).batch("insert into t(id, v) values (?, ?)", rows) { ps, row ->
-     *     ps.setLong(1, row.id); ps.setString(2, row.v)
-     * }
-     * ```
-     */
-    fun <T> batch(sql: String, items: Iterable<T>, binder: (PreparedStatement, T) -> Unit): IntArray =
-        ctx.guardWrite("jdbc.batch", mapOf("sql" to sql.take(80)), dryRunDefault = IntArray(0)) {
-            withConn { conn ->
-                conn.prepareStatement(sql).use { ps ->
-                    for (item in items) {
-                        binder(ps, item)
-                        ps.addBatch()
-                    }
-                    ps.executeBatch()
-                }
-            }
-        }
-
-    /**
-     * Пишущий запрос, возвращающий строки (`INSERT ... RETURNING`, `UPDATE ... RETURNING`).
-     * Проходит dry-run gate как обычная запись: под dry-run [mapper] не вызывается и
-     * возвращается пустой список.
-     *
-     * Существует именно для того, чтобы [query] можно было держать строго читающим: раньше
-     * `query("insert ... returning id")` был единственным способом получить сгенерированные
-     * идентификаторы — и выполнялся в том числе под dry-run, мимо всякого гейта.
-     */
-    fun <T> executeReturning(sql: String, vararg params: Pair<String, Any?>, mapper: (ResultSet) -> T): List<T> {
-        val (rendered, values) = validateAndRender(sql, params)
-        return ctx.guardWrite(
-            "jdbc.executeReturning",
-            mapOf("sql" to sql.take(80)),
-            dryRunDefault = emptyList(),
-        ) {
-            withConn { conn ->
-                conn.prepareStatement(rendered).use { ps ->
-                    bindValues(ps, values)
-                    ps.executeQuery().use { rs ->
-                        val out = ArrayList<T>()
-                        while (rs.next()) out += mapper(rs)
-                        out
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Транзакционный scope под dry-run: реальное соединение не открывается (это дало бы
-     * BEGIN/COMMIT round-trip на каждый блок), но ThreadLocal-флаг взводится тот же самый.
-     * Без него вложенный `transactional` детектировался бы только в бою — репетиция проходила
-     * бы зелёной ровно там, где боевой прогон падает.
-     */
-    internal fun <R> runDryRunTx(block: SqlOps.() -> R): R {
-        txInProgress.set(true)
-        try {
-            return block()
-        } finally {
-            txInProgress.set(false)
-        }
-    }
-
-    internal fun <R> runRealTx(block: SqlOps.() -> R): R {
-        if (txInProgress.get()) {
-            throw IllegalStateException(
-                "nested transactional not supported (a transaction is already open on this thread)",
-            )
-        }
-        txInProgress.set(true)
-        try {
-            return db.inTx<R> { conn ->
-                val txOps = SqlOps(ctx, db, txConn = conn, inTx = true)
-                txOps.block()
-            }
-        } finally {
-            txInProgress.set(false)
-        }
-    }
-
-    /**
-     * Есть ли уже открытая транзакция на текущем потоке. Проверяет два источника:
-     *
-     * 1. **ThreadLocal-флаг** [txInProgress], который мы взводим в [runRealTx] на время блока —
-     *    это primary guard, работает одинаково в проде и в тестах.
-     * 2. **`db.currentConnection()`** — secondary защита для случаев, когда tx открыта внешним
-     *    коду (не через наш `transactional`), но на том же `JdbcConnectionFactory`. В тестовой
-     *    `TestJdbcConnectionFactory` всегда `null`, в production-Kora — non-null внутри `inTx`.
-     */
-    internal fun hasActiveTxConnection(): Boolean = txInProgress.get() || db.currentConnection() != null
-
-    private fun <R> withConn(block: (Connection) -> R): R =
+    protected fun <R> withConn(block: (Connection) -> R): R =
         if (txConn != null) {
             check(Thread.currentThread() === txOwner) {
                 "tx-bound jdbc ops used from thread '${Thread.currentThread().name}', but the " +
@@ -246,13 +145,6 @@ class SqlOps internal constructor(
         }
 
     companion object {
-        // Per-thread флаг «мы внутри transactional». Используется как guard против вложенных
-        // `transactional(outerOps) { transactional(outerOps) { ... } }` — без этого второй
-        // вызов проходил бы по `ops.inTx == false`-branch и открывал бы вторую независимую tx.
-        // Static (companion), чтобы один SqlOps-инстанс не "видел" tx другого: jdbc(db) каждый
-        // раз создаёт новый SqlOps, флаг должен быть общий для всех SqlOps на потоке.
-        private val txInProgress: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
-
         private val READ_ONLY_KEYWORDS = setOf("select", "with", "show", "explain", "values", "table", "describe")
     }
 
@@ -396,7 +288,7 @@ class SqlOps internal constructor(
      *
      * Возвращает (rendered SQL, упорядоченный список значений в порядке `?`).
      */
-    private fun validateAndRender(sql: String, params: Array<out Pair<String, Any?>>): Pair<String, List<Any?>> {
+    protected fun validateAndRender(sql: String, params: Array<out Pair<String, Any?>>): Pair<String, List<Any?>> {
         val providedKeys = params.map { it.first }
         val duplicates = providedKeys.groupingBy { it }.eachCount().filter { it.value > 1 }.keys
         if (duplicates.isNotEmpty()) {
@@ -467,19 +359,153 @@ class SqlOps internal constructor(
         return ""
     }
 
-    private fun bindValues(ps: PreparedStatement, values: List<Any?>) {
+    protected fun bindValues(ps: PreparedStatement, values: List<Any?>) {
         values.forEachIndexed { idx, v -> ps.setObject(idx + 1, v) }
     }
 }
 
 /**
- * Фабрика [SqlOps] для конкретного [JdbcConnectionFactory]. Идиоматический вызов:
+ * JDBC-операции с записью: [execute], [batch], [executeReturning] плюс всё чтение из [SqlReadOps].
+ *
+ * Создаётся через [jdbc] на [HandlerScope] и потому доступна только из обработчика элемента.
+ * Пишущие методы идут через `guardWrite` — под dry-run пропускаются.
+ */
+class SqlOps internal constructor(
+    ctx: RunScope,
+    db: JdbcConnectionFactory,
+    private val txConn: Connection?,
+    inTx: Boolean,
+) : SqlReadOps(ctx, db, txConn, inTx) {
+
+    /**
+     * `INSERT`/`UPDATE`/`DELETE`. Возвращает число затронутых строк. Под dry-run — возвращает
+     * `0`, в лог `INFO [DRY-RUN] jdbc.execute (sql=...)`.
+     */
+    fun execute(sql: String, vararg params: Pair<String, Any?>): Int {
+        val (rendered, values) = validateAndRender(sql, params)
+        return ctx.guardWrite("jdbc.execute", mapOf("sql" to sql.take(80)), dryRunDefault = 0) {
+            withConn { conn ->
+                conn.prepareStatement(rendered).use { ps ->
+                    bindValues(ps, values)
+                    ps.executeUpdate()
+                }
+            }
+        }
+    }
+
+    /**
+     * `INSERT ... VALUES (...)` batch с executeBatch. Параметры — позиционные `?`, биндинг
+     * через [binder]:
+     * ```
+     * jdbc(db).batch("insert into t(id, v) values (?, ?)", rows) { ps, row ->
+     *     ps.setLong(1, row.id); ps.setString(2, row.v)
+     * }
+     * ```
+     */
+    fun <T> batch(sql: String, items: Iterable<T>, binder: (PreparedStatement, T) -> Unit): IntArray =
+        ctx.guardWrite("jdbc.batch", mapOf("sql" to sql.take(80)), dryRunDefault = IntArray(0)) {
+            withConn { conn ->
+                conn.prepareStatement(sql).use { ps ->
+                    for (item in items) {
+                        binder(ps, item)
+                        ps.addBatch()
+                    }
+                    ps.executeBatch()
+                }
+            }
+        }
+
+    /**
+     * Пишущий запрос, возвращающий строки (`INSERT ... RETURNING`, `UPDATE ... RETURNING`).
+     * Проходит dry-run gate как обычная запись: под dry-run [mapper] не вызывается и
+     * возвращается пустой список.
+     *
+     * Существует именно для того, чтобы [query] можно было держать строго читающим: раньше
+     * `query("insert ... returning id")` был единственным способом получить сгенерированные
+     * идентификаторы — и выполнялся в том числе под dry-run, мимо всякого гейта.
+     */
+    fun <T> executeReturning(sql: String, vararg params: Pair<String, Any?>, mapper: (ResultSet) -> T): List<T> {
+        val (rendered, values) = validateAndRender(sql, params)
+        return ctx.guardWrite(
+            "jdbc.executeReturning",
+            mapOf("sql" to sql.take(80)),
+            dryRunDefault = emptyList(),
+        ) {
+            withConn { conn ->
+                conn.prepareStatement(rendered).use { ps ->
+                    bindValues(ps, values)
+                    ps.executeQuery().use { rs ->
+                        val out = ArrayList<T>()
+                        while (rs.next()) out += mapper(rs)
+                        out
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Транзакционный scope под dry-run: реальное соединение не открывается (это дало бы
+     * BEGIN/COMMIT round-trip на каждый блок), но ThreadLocal-флаг взводится тот же самый.
+     * Без него вложенный `transactional` детектировался бы только в бою — репетиция проходила
+     * бы зелёной ровно там, где боевой прогон падает.
+     */
+    internal fun <R> runDryRunTx(block: SqlOps.() -> R): R {
+        txInProgress.set(true)
+        try {
+            return block()
+        } finally {
+            txInProgress.set(false)
+        }
+    }
+
+    internal fun <R> runRealTx(block: SqlOps.() -> R): R {
+        if (txInProgress.get()) {
+            throw IllegalStateException(
+                "nested transactional not supported (a transaction is already open on this thread)",
+            )
+        }
+        txInProgress.set(true)
+        try {
+            return db.inTx<R> { conn ->
+                val txOps = SqlOps(ctx, db, txConn = conn, inTx = true)
+                txOps.block()
+            }
+        } finally {
+            txInProgress.set(false)
+        }
+    }
+
+    /**
+     * Есть ли уже открытая транзакция на текущем потоке. Проверяет два источника:
+     *
+     * 1. **ThreadLocal-флаг** [txInProgress], который мы взводим в [runRealTx] на время блока —
+     *    это primary guard, работает одинаково в проде и в тестах.
+     * 2. **`db.currentConnection()`** — secondary защита для случаев, когда tx открыта внешним
+     *    коду (не через наш `transactional`), но на том же `JdbcConnectionFactory`. В тестовой
+     *    `TestJdbcConnectionFactory` всегда `null`, в production-Kora — non-null внутри `inTx`.
+     */
+    internal fun hasActiveTxConnection(): Boolean = txInProgress.get() || db.currentConnection() != null
+}
+
+/**
+ * Чтение из БД — доступно в любом scope'е прогона:
+ * ```
+ * source(items = { jdbc(db).query("select id from t") { it.getLong("id") }.asSequence() }) { ... }
+ * ```
+ */
+fun RunScope.jdbc(db: JdbcConnectionFactory): SqlReadOps = SqlReadOps(this, db, txConn = null, inTx = false)
+
+/**
+ * Чтение и запись — только в обработчике элемента:
  * ```
  * jdbc(db).execute("update ...")
  * transactional(jdbc(db)) { execute("..."); execute("...") }
  * ```
+ * Перегрузка по receiver'у: внутри `handle` побеждает эта, в `items`/`validate` доступна только
+ * читающая. Разрешение статическое, по объявленному типу scope'а, а не по факту исполнения.
  */
-fun RunScope.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, txConn = null, inTx = false)
+fun HandlerScope.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, txConn = null, inTx = false)
 
 /**
  * Реальный транзакционный scope. Открывает один [Connection] через `db.inTx`, создаёт
@@ -491,7 +517,7 @@ fun RunScope.jdbc(db: JdbcConnectionFactory): SqlOps = SqlOps(this, db, txConn =
  *
  * @throws IllegalStateException если [ops] уже находится внутри активной транзакции.
  */
-fun <R> RunScope.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
+fun <R> HandlerScope.transactional(ops: SqlOps, block: SqlOps.() -> R): R {
     if (ops.inTx) throw IllegalStateException("nested transactional not supported (already in tx-bound SqlOps)")
     // Доп. guard: пользователь мог передать **внешний** free-mode `ops` внутри уже открытого
     // `transactional` — тогда `ops.inTx == false`, но Kora уже держит открытую tx на текущем

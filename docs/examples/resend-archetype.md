@@ -58,23 +58,20 @@ dependencies {
     implementation("io.github.dsudomoin.migration:migration-dsl-kora:0.1.0")
 
     // Kora — подключаем только то, что реально используем
-    implementation("ru.tinkoff.kora:common:1.1.25")
-    implementation("ru.tinkoff.kora:config-common:1.1.25")
-    implementation("ru.tinkoff.kora:config-hocon:1.1.25")
-    implementation("ru.tinkoff.kora:application-graph:1.1.25")
-    implementation("ru.tinkoff.kora:database-jdbc:1.1.25")
-    implementation("ru.tinkoff.kora:kafka:1.1.25")
-    implementation("ru.tinkoff.kora:json-module:1.1.25")     // @Json-значение публикуемого события
-    implementation("ru.tinkoff.kora:http-client-jdk:1.1.25")
-    implementation("ru.tinkoff.kora:resilient-kora:1.1.25")  // @Retry на клиенте обогащения
+    implementation(platform("ru.tinkoff.kora:kora-parent:1.2.20"))
 
-    // Драйвер БД
-    runtimeOnly("org.postgresql:postgresql:42.7.7")
-    // Runner пишет logs/<migration>/migration.log через logback-аппендер на root-логгере.
-    // Без logback на classpath он предупредит и продолжит без файлового лога.
-    runtimeOnly("ch.qos.logback:logback-classic:1.5.16")
+    implementation("ru.tinkoff.kora:common")
+    implementation("ru.tinkoff.kora:config-common")
+    implementation("ru.tinkoff.kora:config-hocon")
+    implementation("ru.tinkoff.kora:application-graph")
+    implementation("ru.tinkoff.kora:database-jdbc")
+    implementation("ru.tinkoff.kora:kafka")
+    implementation("ru.tinkoff.kora:json-module")     // @Json-значение публикуемого события
+    implementation("ru.tinkoff.kora:http-client-jdk")
+    implementation("ru.tinkoff.kora:resilient-kora")  // @Retry на клиенте обогащения
 
-    ksp("ru.tinkoff.kora:symbol-processors:1.1.25")
+    ksp(platform("ru.tinkoff.kora:kora-parent:1.2.20"))
+    ksp("ru.tinkoff.kora:symbol-processors")
 }
 ```
 

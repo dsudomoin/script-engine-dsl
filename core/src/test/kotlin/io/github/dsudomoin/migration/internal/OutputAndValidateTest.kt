@@ -1,10 +1,13 @@
 package io.github.dsudomoin.migration.internal
 
+import io.github.dsudomoin.migration.OutputHandle
 import io.github.dsudomoin.migration.migration
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.io.IOException
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.readLines
 
@@ -118,5 +121,24 @@ class OutputAndValidateTest {
         })
 
         assertThat(seenDryRun).isTrue()
+    }
+
+    @Test
+    fun `сбой открытия второго output отвязывает первый`() {
+        // Родителем второго пути делаем обычный файл: createDirectories по нему обязан упасть.
+        Files.writeString(folder.resolve("blocked"), "not a directory")
+        lateinit var first: OutputHandle
+        val plan = migration("OUT", "t") {
+            first = output("ok.csv", "a")
+            output("blocked/inner.csv", "b")
+            source(items = { emptySequence<Int>() }) { }
+        }
+
+        assertThatThrownBy { PlanInterpreter(RunContext.test(outputFolder = folder)).execute(plan) }
+            .isInstanceOf(IOException::class.java)
+
+        assertThatThrownBy { first.row("x") }
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("is not bound to a run")
     }
 }

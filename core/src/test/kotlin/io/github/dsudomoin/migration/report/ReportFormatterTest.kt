@@ -69,4 +69,47 @@ class ReportFormatterTest {
         val text = ReportFormatter(asciiOnly = false).format(sample())
         assertThat(text).doesNotContain("Warnings:", "⚠", "[!]")
     }
+
+    @Test
+    fun `многофазный отчёт печатает секцию по каждой фазе`() {
+        val builder = ReportBuilder("M", "t", false)
+        builder.beginPhase("copy portfolios")
+        repeat(3) { builder.incProcessed(); builder.incSuccessful(); builder.incAppliedWrite("db.update") }
+        builder.endPhase()
+        builder.beginPhase("copy dividends")
+        builder.incProcessed()
+        builder.incSkipped()
+        builder.addBarrierOutcome(acked = 5, failed = 1, abandoned = 0, late = 0)
+        builder.endPhase()
+
+        val text = ReportFormatter(asciiOnly = true).format(builder.build())
+
+        assertThat(text).contains("Phases:")
+        assertThat(text).containsPattern("copy portfolios[\\s\\S]*?processed 3, ok 3")
+        assertThat(text).containsPattern("copy portfolios[\\s\\S]*?applied db.update: 3")
+        assertThat(text).containsPattern("copy dividends[\\s\\S]*?skipped 1")
+        assertThat(text).containsPattern("copy dividends[\\s\\S]*?acked 5")
+        assertThat(text).containsPattern("copy dividends[\\s\\S]*?failed effects 1")
+    }
+
+    @Test
+    fun `однофазный отчёт секции фаз не печатает`() {
+        val builder = ReportBuilder("M", "t", false)
+        builder.beginPhase("phase-1")
+        builder.incProcessed()
+        builder.incSuccessful()
+        builder.endPhase()
+
+        assertThat(ReportFormatter(asciiOnly = true).format(builder.build())).doesNotContain("Phases:")
+    }
+
+    @Test
+    fun `unhandled failures печатаются отдельной строкой от failed`() {
+        val builder = ReportBuilder("M", "t", false)
+        builder.recordRunFailure()
+        val text = ReportFormatter(asciiOnly = true).format(builder.build())
+
+        assertThat(text).contains("Unhandled failures:")
+        assertThat(text).containsPattern("Failed:\\s+0")
+    }
 }

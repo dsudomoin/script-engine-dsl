@@ -10,6 +10,7 @@ import io.github.dsudomoin.migration.ScriptPolicy
 import io.github.dsudomoin.migration.error.CsvFileErrorReporter
 import io.github.dsudomoin.migration.internal.RunContext
 import io.github.dsudomoin.migration.internal.PlanInterpreter
+import io.github.dsudomoin.migration.report.MigrationReport
 import io.github.dsudomoin.migration.report.ReportBuilder
 import io.github.dsudomoin.migration.report.ReportFormatter
 import org.slf4j.Logger
@@ -43,17 +44,24 @@ import kotlin.system.exitProcess
  * 8. Печать отчёта в лог, exit с кодом 0 / 1 / 2.
  *
  * Exit-коды:
- * - `0` — success (включая `LOG_AND_COMPLETE`-сценарии с залогированными ошибками).
- * - `1` — `FAIL_FAST` от unhandled-исключения или `errorThreshold` exceeded.
- * - `2` — misconfiguration (unknown name, duplicate name).
+ * - `0` — success.
+ * - `1` — `FAIL_FAST` от unhandled-исключения; превышенный `errorThreshold` фазы; любой отказ
+ *   асинхронного эффекта (провалившийся, неподтверждённый или зарегистрированный после барьера);
+ *   прерывание прогона. Последние два — независимо от [ScriptPolicy]: `LOG_AND_COMPLETE` покрывает
+ *   допустимые отказы скрипта, но не нарушение гарантии доставки.
+ * - `2` — misconfiguration: unknown name, duplicate name, битый `outputFolder`, ошибка построения
+ *   плана, расхождение [MigrationDefinition.name] и имени плана.
  *
  * @param customExecutor если не `null`, используется вместо дефолт-FixedThreadPool.
- * @param exit инжекция для тестов — по умолчанию `System.exit`.
+ * @param onReport инжекция для тестов: готовый отчёт до того, как он уйдёт в лог.
+ * @param exit инжекция для тестов — по умолчанию `System.exit`. Стоит последним намеренно:
+ *             trailing-лямбда на месте вызова обязана означать именно завершение процесса.
  */
 class MigrationRunner(
     private val config: MigrationConfig,
     private val definitions: List<MigrationDefinition>,
     private val customExecutor: Executor?,
+    private val onReport: (MigrationReport) -> Unit = {},
     private val exit: (Int) -> Unit = { exitProcess(it) },
 ) : Lifecycle {
 
@@ -108,6 +116,28 @@ class MigrationRunner(
             definition.plan()
         } catch (e: Exception) {
             log.error("Cannot build plan of migration '${definition.name}'", e)
+            return 2
+        }
+
+        // Выбор миграции, папка артефактов и проверка дублей идут по definition.name, а отчёт и
+        // контекст логов — по plan.name. Разъехавшиеся имена означают, что запустили не то, что
+        // назвали: это мисконфиг, а не деталь оформления.
+        if (plan.name != definition.name) {
+            log.error(
+                "Migration '${definition.name}' builds a plan named '${plan.name}': " +
+                    "MigrationDefinition.name and migration(name = ...) must match",
+            )
+            return 2
+        }
+
+        // Reporter создаёт файлы лениво, поэтому чистый прогон в той же папке иначе унаследовал бы
+        // errors.csv прошлого запуска и приложил бы его к своему отчёту. Один прогон — один свежий
+        // набор артефактов, как у migration.log (FileAppender.isAppend = false).
+        try {
+            val stale = listOf(errorsFile, traceFile).count { Files.deleteIfExists(it) }
+            if (stale > 0) log.info("removed $stale stale error artifact(s) left by a previous run")
+        } catch (e: Exception) {
+            log.error("Cannot clear stale error artifacts in '$outputFolder'", e)
             return 2
         }
 
@@ -174,18 +204,18 @@ class MigrationRunner(
 
             // Отказы доставки прилетают асинхронно и учитываются в момент flush'а продюсера,
             // то есть уже после того, как runMigration вернул код. Прогон, потерявший сообщения,
-            // не имеет права закончиться нулём.
-            // Отправленное, но неподтверждённое, обязано поднимать код возврата независимо от
-            // ScriptPolicy: LOG_AND_COMPLETE не должен превращать потерянные сообщения в ноль.
-            val unconfirmed = report.unconfirmedEffectsCount()
-            if (unconfirmed > 0 && code == 0) {
-                log.error("$unconfirmed async effect(s) were never confirmed; see the report")
+            // не имеет права закончиться нулём — ни при какой ScriptPolicy: LOG_AND_COMPLETE
+            // покрывает допустимые отказы скрипта, а не нарушение гарантии доставки.
+            val effectFailures = report.effectFailureCount()
+            if (effectFailures > 0 && code == 0) {
+                log.error("$effectFailures async effect(s) failed or were never confirmed; see the report")
                 code = 1
             }
 
             val errorsFileOrNull = errorsFile.takeIf { Files.exists(it) }
             val traceFileOrNull = traceFile.takeIf { Files.exists(it) }
             val built = report.build(errorsFileOrNull, traceFileOrNull)
+            onReport(built)
             log.info("\n" + ReportFormatter(config.report().asciiOnly()).format(built))
             return code
         } finally {
@@ -258,17 +288,18 @@ class MigrationRunner(
         return true
     }
 
+    /**
+     * Порог ошибок принадлежит фазе и проверяется интерпретатором в реальном времени
+     * ([io.github.dsudomoin.migration.internal.ErrorThresholdExceeded] валит стадию), а
+     * `migration.defaults.errorThreshold` — лишь дефолт для фазы без своего значения. Второй,
+     * post-mortem, проверки здесь нет намеренно: она сравнивала общий `skipped` всего прогона с
+     * глобальным дефолтом и отменяла собственный override стадии — одно имя означало две разные
+     * области действия.
+     */
     private fun runMigration(plan: MigrationPlan, ctx: RunContext): Int {
         return try {
             PlanInterpreter(ctx).execute(plan)
-            // Post-mortem threshold check на случай, если миграция дошла до конца естественно,
-            // но количество skipped к этому моменту перевалило за порог. Realtime-check внутри
-            // Стадия обычно ловит первой.
-            val thr = config.defaults().errorThreshold()
-            if (thr > 0 && ctx.report.skippedCount() > thr) {
-                log.error("Error threshold exceeded: skipped=${ctx.report.skippedCount()} > $thr")
-                1
-            } else 0
+            0
         } catch (e: Throwable) {
             // Безопасный аудит — если errors.csv недоступен, не теряем оригинальный e.
             try {
@@ -279,9 +310,18 @@ class MigrationRunner(
                     "auditError failed: ${auditErr.javaClass.simpleName}: ${auditErr.message ?: ""}"
                 )
             }
-            ctx.report.incFailed()
-            val policy = plan.onUnhandled ?: config.defaults().onUnhandled()
-            when (policy) {
+            // Отдельно от incFailed(): у отказа стадии могло не быть обрабатываемого элемента,
+            // и общий счётчик ломал бы тождество processed = successful + skipped + failed.
+            ctx.report.recordRunFailure()
+
+            if (isInterruption(e)) {
+                // Прерванный одноразовый процесс не завершился успешно, какой бы ни была политика:
+                // часть работы не сделана, часть эффектов не подтверждена.
+                Thread.currentThread().interrupt()
+                log.error("Migration ${plan.name} was INTERRUPTED", e)
+                return 1
+            }
+            when (plan.onUnhandled ?: config.defaults().onUnhandled()) {
                 ScriptPolicy.FAIL_FAST -> {
                     log.error("Migration ${plan.name} FAILED", e); 1
                 }
@@ -291,6 +331,18 @@ class MigrationRunner(
                 }
             }
         }
+    }
+
+    // InterruptedException приезжает завёрнутым: барьер вешает свои ошибки в suppressed, а ops
+    // оборачивают чужие исключения в свои. Идентичность в множестве — защита от циклов cause.
+    private fun isInterruption(e: Throwable): Boolean {
+        val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+        fun walk(t: Throwable?): Boolean {
+            if (t == null || !seen.add(t)) return false
+            if (t is InterruptedException) return true
+            return walk(t.cause) || t.suppressed.any { walk(it) }
+        }
+        return walk(e)
     }
 
     /**
