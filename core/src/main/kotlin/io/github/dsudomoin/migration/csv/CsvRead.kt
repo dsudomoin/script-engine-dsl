@@ -110,12 +110,20 @@ private fun RunScope.handleRowError(e: Throwable, onRowError: ItemError<Map<Stri
         Thread.currentThread().interrupt()
         throw e
     }
-    val decision = when (onRowError) {
-        is ItemError.Fail -> ItemError.Decision.Fail
-        is ItemError.Skip -> ItemError.Decision.Skip
-        // Классификатор получает саму разобранную строку: без неё нельзя отличить битую запись
-        // от записи с недопустимым значением.
-        is ItemError.Handle -> onRowError.decide(e, row ?: emptyMap())
+    val decision = try {
+        when (onRowError) {
+            is ItemError.Fail -> ItemError.Decision.Fail
+            is ItemError.Skip -> ItemError.Decision.Skip
+            // Классификатор получает саму разобранную строку: без неё нельзя отличить битую запись
+            // от записи с недопустимым значением.
+            is ItemError.Handle -> onRowError.decide(e, row ?: emptyMap())
+        }
+    } catch (classifierError: Throwable) {
+        // Та же семантика, что у классификатора элемента стадии: сбой классификатора становится
+        // основной ошибкой, исходная ошибка строки сохраняется в suppressed и попадает в аудит.
+        classifierError.addSuppressed(e)
+        auditError(classifierError, row)
+        throw classifierError
     }
     if (decision == ItemError.Decision.Fail) throw e
 

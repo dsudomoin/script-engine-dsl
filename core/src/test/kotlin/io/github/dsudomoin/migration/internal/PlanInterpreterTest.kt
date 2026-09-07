@@ -7,7 +7,9 @@ import io.github.dsudomoin.migration.migration
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
+import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
+import kotlin.io.path.readText
 
 class PlanInterpreterTest {
 
@@ -195,5 +197,31 @@ class PlanInterpreterTest {
         }.hasRootCauseMessage("broker down")
 
         assertThat(skippedByPolicy).isFalse()
+    }
+
+    @Test
+    fun `падение классификатора сохраняет исходную ошибку, аудит и тождество отчёта`() {
+        val folder = Files.createTempDirectory("classifier-")
+        val ctx = RunContext.test(name = "cls", outputFolder = folder)
+        val plan = migration("CLS", "t") {
+            source(
+                onItemError = ItemError.Handle<Int> { _, _ -> error("classifier exploded") },
+                items = { sequenceOf(42) },
+            ) { error("item exploded") }
+        }
+
+        assertThatThrownBy { PlanInterpreter(ctx).execute(plan) }
+            .hasMessage("classifier exploded")
+            .satisfies({ e -> assertThat(e.suppressed.map { it.message }).contains("item exploded") })
+
+        ctx.errors.close()
+        assertThat(folder.resolve("errors.csv").readText())
+            .describedAs("элемент обязан попасть в аудит, несмотря на сбой классификатора")
+            .contains("42")
+            .contains("classifier exploded")
+
+        val report = ctx.report.build()
+        assertThat(report.failed).isEqualTo(1)
+        assertThat(report.processed).isEqualTo(report.successful + report.skipped + report.failed)
     }
 }

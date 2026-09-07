@@ -7,11 +7,13 @@ import io.github.dsudomoin.migration.InputScope
 import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.Progress
 import io.github.dsudomoin.migration.MigrationPlan
+import io.github.dsudomoin.migration.OutputHandle
 import io.github.dsudomoin.migration.RunScope
 import io.github.dsudomoin.migration.SourceScope
 import io.github.dsudomoin.migration.Stage
 import io.github.dsudomoin.migration.WriteOutcome
 import io.github.dsudomoin.migration.WriteResult
+import io.github.dsudomoin.migration.csv.CsvOutput
 import io.github.dsudomoin.migration.csv.openCsv
 import java.time.Duration
 import java.util.concurrent.CompletionStage
@@ -37,13 +39,18 @@ class PlanInterpreter(
     private val inputs = ConcurrentHashMap<Input<*>, Any?>()
 
     fun execute(plan: MigrationPlan) {
-        val outputs = plan.outputs.map { handle ->
-            val csv = base.openCsv(handle.filename, *handle.headers.toTypedArray())
-            handle.bind(csv)
-            handle to csv
-        }
+        val outputs = mutableListOf<Pair<OutputHandle, CsvOutput>>()
 
         try {
+            // Открытие внутри try: если второй выход не открылся, первый обязан быть закрыт и
+            // отвязан. Иначе он остаётся привязанным к writer'у, который позже закроет реестр
+            // прогона, и повторное исполнение того же плана пишет в мёртвый файл.
+            for (handle in plan.outputs) {
+                val csv = base.openCsv(handle.filename, *handle.headers.toTypedArray())
+                handle.bind(csv)
+                outputs += handle to csv
+            }
+
             plan.validation?.let { check ->
                 StageScope(base, CompletionTracker(), inputs).check()
             }
@@ -55,9 +62,10 @@ class PlanInterpreter(
                 }
             }
         } finally {
-            // Закрываем сами: реестр прогона сделает это повторно и идемпотентно, зато строки гарантированно
-            // оказываются на диске к моменту, когда прогон считается завершённым.
-            outputs.forEach { (handle, csv) ->
+            // Закрываем сами и в обратном порядке: реестр прогона сделает это повторно и идемпотентно,
+            // зато строки гарантированно оказываются на диске к моменту, когда прогон считается
+            // завершённым.
+            outputs.asReversed().forEach { (handle, csv) ->
                 try {
                     csv.close()
                 } catch (e: Throwable) {
@@ -274,10 +282,19 @@ class PlanInterpreter(
         skipped: AtomicLong,
         threshold: Long,
     ) {
-        val decision = when (policy) {
-            is ItemError.Fail -> ItemError.Decision.Fail
-            is ItemError.Skip -> ItemError.Decision.Skip
-            is ItemError.Handle -> policy.decide(e, item)
+        val decision = try {
+            when (policy) {
+                is ItemError.Fail -> ItemError.Decision.Fail
+                is ItemError.Skip -> ItemError.Decision.Skip
+                is ItemError.Handle -> policy.decide(e, item)
+            }
+        } catch (classifierError: Throwable) {
+            // Сбой классификатора не имеет права проглотить отказ элемента: исходная ошибка уходит
+            // в suppressed, элемент всё равно аудитится, и оба конца видны в errors.csv.
+            classifierError.addSuppressed(e)
+            safeAudit(classifierError, item)
+            base.report.incFailed()
+            throw classifierError
         }
         safeAudit(e, item)
         when (decision) {
