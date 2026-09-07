@@ -120,6 +120,12 @@ class PlanInterpreter(
             tracker.sealAndAwait(timeout)
         } catch (barrierError: Throwable) {
             failure = failure?.also { it.addSuppressed(barrierError) } ?: barrierError
+        }
+
+        // Итоги снимаются ПОСЛЕ закрытия ресурсов: закрывающийся ресурс может попытаться дослать
+        // «хвост», и такая поздняя регистрация обязана попасть в отчёт именно этого scope'а.
+        try {
+            closeScopedResources(scope)
         } finally {
             base.report.addBarrierOutcome(
                 acked = tracker.acked,
@@ -127,9 +133,10 @@ class PlanInterpreter(
                 abandoned = tracker.abandoned,
                 late = tracker.lateRegistered,
             )
+            tracker.callbackFailures.forEach {
+                base.report.addWarning("effect audit failed: ${it.javaClass.simpleName}: ${it.message ?: ""}")
+            }
         }
-
-        closeScopedResources(scope)
 
         failure?.let { throw it }
     }

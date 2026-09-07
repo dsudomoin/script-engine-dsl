@@ -28,3 +28,13 @@ class ScopeEffectsFailed internal constructor(
  * отдельной строкой — молча исчезать они не должны.
  */
 class ScopeCompletionTimeout internal constructor(message: String) : RuntimeException(message)
+
+/**
+ * Эффект зарегистрирован после того, как барьер scope'а уже закрыл регистрацию.
+ *
+ * Отправка при этом **не выполняется**. Подтверждения такого эффекта уже никто не ждёт, ресурсы
+ * scope'а закрыты, а код возврата мог быть посчитан — движок не имеет права запускать наружу то,
+ * за чем не может проследить. Практически это означает `publish` из потока, который пережил стадию:
+ * либо этот поток должен завершаться внутри обработчика, либо отправка должна идти из него.
+ */
+class LateEffectRegistration internal constructor(message: String) : IllegalStateException(message)
