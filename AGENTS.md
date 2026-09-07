@@ -397,6 +397,12 @@ still closed). It never lets the run continue into the next stage — a
 failed stage always stops the run; the policy only picks the exit code.
 Item-level errors are handled by `ItemError` (§7.8), not by this.
 
+`LOG_AND_COMPLETE` has two hard limits it cannot lower to 0. **Any effect
+failure** — `failedEffects`, `abandonedPublishes` or `lateRegistered` — and
+**an interrupted run** both force exit 1. The policy covers script failures
+the operator is willing to tolerate; it does not cover a broken delivery
+guarantee or a half-finished process.
+
 ### 7.2 Builder nodes: `input`, `validate`, `output`
 
 ```kotlin
@@ -404,6 +410,13 @@ fun <I> input(name: String, load: InputScope.() -> I): Input<I>
 fun validate(check: InputScope.() -> Unit)
 fun output(filename: String, vararg headers: String): OutputHandle
 ```
+
+`output` rejects the three names the engine opens itself — `errors.csv`,
+`errors.log`, `migration.log` — along with their normalized spellings
+(`./errors.csv`, `sub/../errors.log`), and rejects any path that leaves the
+output folder. Both the user output and the engine open such a file with
+`TRUNCATE_EXISTING`, so the collision would silently destroy the run's own
+audit trail.
 
 **`input`** is a lazy, run-scoped value. It is resolved by
 `SourceScope.resolve(input)` on first use and cached for the rest of the
@@ -425,9 +438,11 @@ source(
 cannot resolve another input. Get a value into the handler by putting it
 into the element type, or by making it the parent of a `scoped` stage.
 
-The cache is a `ConcurrentHashMap`, so an input whose loader returns `null`
-is not memoized and its loader runs again on every `resolve`. Load a
-nullable value into a wrapper (or a default) if the load is expensive.
+An input whose loader returns `null` is memoized like any other: the value
+is wrapped before it goes into the cache, because `ConcurrentHashMap` does
+not store `null` and `computeIfAbsent` would otherwise re-run the loader on
+every `resolve`. A loader that throws is *not* cached — the next `resolve`
+calls it again rather than remembering a fake `null`.
 
 **`validate`** runs once, before the first stage and before any effect. Its
 failure ends the run with nothing done. Use it for config assertions and
@@ -788,13 +803,16 @@ exactly one worker observes the breach and the number of skips that
 actually happened does not depend on the scheduler. The stage argument
 overrides `migration.defaults.errorThreshold` for that stage only.
 
-Two things this does not cover:
+There is exactly **one** threshold model: the threshold belongs to the
+phase, is checked in real time, and `migration.defaults.errorThreshold` is
+only the default for a phase that does not set its own. There is no second,
+post-mortem check — an earlier version compared the run-wide skip count
+against the global default and thereby cancelled a phase's own override, so
+one name meant two different scopes.
 
-- rows dropped by `readCsv(onRowError = ItemError.Skip)` increment
-  `report.skipped` but not the *stage* counter (they never reach a handler);
-- after a run that ended normally the runner performs one more check with
-  the **global** skip count against `migration.defaults.errorThreshold`
-  (per-stage overrides do not apply there) and returns 1 if it is exceeded.
+One thing this does not cover: rows dropped by
+`readCsv(onRowError = ItemError.Skip)` increment `report.sourceSkipped`,
+not the phase counter — they never reach a handler.
 
 There is **no built-in retry primitive at the item level** — deliberately.
 Item-level retry re-runs the entire handler for one item, which silently
@@ -867,7 +885,10 @@ The reporter writes `errors.csv` (one row per audited item:
 `timestamp,migration,author,itemRepr,errorClass,errorMessage`, UTC) and
 `errors.log` (stack traces if `errorReporting.includeStackTrace = true`).
 Both files are created lazily on the first error, so a clean run leaves
-neither behind. Besides item errors, the sink receives skipped `readCsv`
+neither behind. The runner also deletes both **before** the run starts: the
+default output folder (`logs/<migration-name>`) is stable, so without that a
+clean re-run would inherit the previous run's `errors.csv` and attach it to
+its own report. Besides item errors, the sink receives skipped `readCsv`
 rows, every failed `publish` effect, and the exception that escapes the
 stages.
 
@@ -962,26 +983,68 @@ fun scopedResource(close: () -> Unit)               // SourceScope — closed at
 | `dryRunSkipped` | every gated call under dry-run, keyed by name/label |
 | `acknowledgedPublishes` / `failedEffects` / `abandonedPublishes` / `lateRegistered` | the barrier of each scope |
 | `rawPages` / `rawRows` | `pages(...)`, before your filters |
-| `warnings` | non-fatal problems: failed `close()`, dropped pool tasks, the dry-run "0 writes" alarm |
+| `warnings` | non-fatal problems: failed `close()`, dropped pool tasks, a failed effect audit, the dry-run "0 writes" alarm |
 | `sourceSkipped` | rows dropped while reading the source (broken CSV); they never reached a stage |
+| `unhandledFailures` | failures of a stage or of the run itself, where there may have been no element at all |
+| `phases` | per-phase snapshot, in execution order; empty for a single implicit phase |
 
-`processed = successful + skipped + failed` holds by construction. Delivery
-failures are deliberately kept out of `failed` so the identity survives, and
-rows dropped by the source reader go to `sourceSkipped` for the same reason —
-they were never `processed`.
+`processed = successful + skipped + failed` holds by construction. Three
+kinds of number are kept out of it on purpose:
+
+- delivery failures — the element itself was already counted;
+- `sourceSkipped` — the row never reached a stage, so it was never
+  `processed`;
+- `unhandledFailures` — a stage failure may have had no element at all (a
+  broken source, a failed `validate`, a barrier error). This is why the
+  runner calls `recordRunFailure()` rather than `incFailed()`; counting a
+  terminal item failure at both levels used to produce `Processed: 1` with
+  `Failed: 2`.
+
+**Phases.** A plan node — one `source` or one `scoped` — is a phase. In
+`scoped` every parent belongs to the same phase: the phase boundary is the
+node, not the parent. `ReportBuilder` mirrors every counter into the
+current phase, so `report.phases` answers "what happened in *copy
+dividends*?". The list is empty for a migration with a single implicit
+phase, where those numbers would repeat the run totals verbatim; that is
+also why a multi-stage plan requires a name on every stage.
 
 The **printed** report is a subset: header, mode, `processed` /
-`successful` / `skipped` / `failed`, warnings, the dry-run breakdown, and
-the paths of `errors.csv` / `errors.log`. Write, barrier and paging
-counters are in the `MigrationReport` object — read them in tests, or log
-them yourself from a `Progress.Custom` formatter — but they are not in the
-printed block yet.
+`successful` / `skipped` / `failed`, `unhandledFailures`, warnings, the
+dry-run breakdown, the `Phases:` section when there is more than one phase,
+and the paths of `errors.csv` / `errors.log`. The remaining write and
+paging counters live in the `MigrationReport` object — read them in tests,
+or log them yourself from a `Progress.Custom` formatter.
 
 ## 8. API reference — `kora`
 
-Every op is an extension on `RunScope`, so all of them work in `validate`,
-in an `input` loader, in `items` / `parents` and in the handler. Their
-signatures did not change with the plan API; only the receiver did.
+Ops are split by scope: **reads** are extensions on `RunScope` and work
+everywhere, **writes** are extensions on `HandlerScope` and are reachable
+only from the item handler. A source describes data; it does not change the
+outside world. The compiler enforces this — resolution is static, on the
+declared scope type, so `jdbc(db).execute(...)` inside `items { }` does not
+compile.
+
+| Operation | `input` / `validate` / `parents` / `items` | `handle` |
+|---|---|---|
+| `jdbc(db).query` / `.stream` | yes (`SqlReadOps`) | yes (`SqlOps`) |
+| `jdbc(db).execute` / `.batch` / `.executeReturning` | no | yes |
+| `transactional(ops) { }` | no | yes |
+| `cassandra(s).query` | yes (`CassandraReadOps`) | yes (`CassandraOps`) |
+| `cassandra(s).execute` / `.batch` | no | yes |
+| `http(call).get` | yes (`HttpReadOps`) | yes (`HttpOps`) |
+| `http(call).post` / `.put` / `.patch` / `.delete` | no | yes |
+| `kafka(p)` / `topic(p, name)` | no | yes |
+| `readCsv` / `openCsv` / `pages` | yes | yes |
+| `guardWrite` | yes — low-level escape hatch, never used in the guides | yes |
+
+`kafka` and `topic` moved wholesale: they have no read half, and a raw
+`publishAsync` from a source never reached the barrier at all — that was a
+hole in effect accounting, not a matter of style.
+
+The write half is not reachable outside a running plan, which is also true
+in tests: the ops tests in this repository build a `HandlerScope` of their
+own in the test source set rather than opening a seam in the production
+API.
 
 ### 8.1 SQL (`jdbc`, `transactional`)
 
@@ -1340,9 +1403,9 @@ with nothing in the report to say why.
 
 | Code | When |
 |---|---|
-| `0` | Success. Also a `LOG_AND_COMPLETE` run that logged a failure. |
-| `1` | `FAIL_FAST` on anything that escaped the stages — a stage failure, `ScopeEffectsFailed`, `ScopeCompletionTimeout`, `CursorNotAdvancing`, `ErrorThresholdExceeded`; a post-mortem global skip count above `defaults.errorThreshold`; **or** any unconfirmed effect (`abandonedPublishes + lateRegistered > 0`), which raises 0 → 1 regardless of `onUnhandled`. |
-| `2` | Misconfiguration, before any work: unknown `migration.run` name, duplicate migration names in the graph, invalid `migration.*` values, `outputFolder` cannot be created, or `plan()` itself threw. |
+| `0` | Success. Also a `LOG_AND_COMPLETE` run that logged a script failure. |
+| `1` | `FAIL_FAST` on anything that escaped the stages — a stage failure, `ScopeEffectsFailed`, `ScopeCompletionTimeout`, `CursorNotAdvancing`, `ErrorThresholdExceeded`; **any** effect failure (`failedEffects + abandonedPublishes + lateRegistered > 0`); **or** an interrupted run. The last two raise 0 → 1 regardless of `onUnhandled`. |
+| `2` | Misconfiguration, before any work: unknown `migration.run` name, duplicate migration names in the graph, invalid `migration.*` values, `outputFolder` cannot be created, `plan()` itself threw, or `plan.name` differs from `MigrationDefinition.name`. |
 
 Idle (`migration.run` unset) is not an exit code: the runner logs "runner
 idle" and returns without exiting at all — the surrounding Kora application
@@ -1439,8 +1502,10 @@ the latency.
 **A timeout does not recall what was already sent.**
 `ScopeCompletionTimeout` means the scope stopped waiting, not that the
 effects were cancelled: unfinished ones are counted as
-`abandonedPublishes`, effects that settle afterwards are counted as
-`lateRegistered`, and both raise the exit code to 1. `completionTimeout`
+`abandonedPublishes`. An effect registered after the barrier was sealed is
+counted as `lateRegistered` and — unlike before — is **not sent**:
+`publish` throws `LateEffectRegistration` instead. All three counters raise
+the exit code to 1. `completionTimeout`
 bounds **only** the acknowledgement wait after the source is exhausted —
 never the time spent reading the source or sending.
 
