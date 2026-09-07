@@ -36,7 +36,7 @@ class PlanInterpreter(
     private val progressSink: (String) -> Unit = { base.log.info(it) },
 ) {
 
-    private val inputs = ConcurrentHashMap<Input<*>, Any?>()
+    private val inputs = ConcurrentHashMap<Input<*>, ResolvedInput>()
 
     fun execute(plan: MigrationPlan) {
         val outputs = mutableListOf<Pair<OutputHandle, CsvOutput>>()
@@ -347,13 +347,22 @@ class PlanInterpreter(
 }
 
 /**
+ * Разрешённое значение input'а.
+ *
+ * Обёртка, а не сырое значение: `ConcurrentHashMap` не хранит `null`, и `computeIfAbsent` на
+ * input'е со значением `null` не создавал бы mapping — загрузчик вызывался бы на каждый `resolve`.
+ * Исключение загрузчика mapping не создаёт и здесь, поэтому неудача не кэшируется как успешный `null`.
+ */
+internal class ResolvedInput(val value: Any?)
+
+/**
  * Контекст одного scope'а. Реализует все три пользовательских scope'а сразу: разделяются они только
  * типами на границе DSL, а во время исполнения это одно и то же состояние.
  */
 internal class StageScope(
     private val base: RunContext,
     private val tracker: CompletionTracker,
-    private val inputs: ConcurrentHashMap<Input<*>, Any?>,
+    private val inputs: ConcurrentHashMap<Input<*>, ResolvedInput>,
 ) : SourceScope, HandlerScope, InputScope, RunScope by base {
 
     // Обрабатываемый элемент нужен для контекста отказа, а воркеров у стадии может быть несколько.
@@ -363,7 +372,7 @@ internal class StageScope(
 
     @Suppress("UNCHECKED_CAST")
     override fun <I> resolve(input: Input<I>): I =
-        inputs.computeIfAbsent(input) { input.load(this) } as I
+        inputs.computeIfAbsent(input) { ResolvedInput(input.load(this)) }.value as I
 
     override fun <C : Any, T> pages(
         name: String?,
