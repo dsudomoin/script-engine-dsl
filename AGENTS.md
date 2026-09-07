@@ -2091,11 +2091,13 @@ class RedisOps(private val ctx: RunScope, private val client: RedisClient) : Aut
 }
 
 // memoized per client, registered for close — safe to call per item
-fun RunScope.redis(client: RedisClient): RedisOps =
+fun HandlerScope.redis(client: RedisClient): RedisOps =
     shared(client) { RedisOps(this, client) }
 ```
 
-Declare the extension on `RunScope` so it is usable in `validate`, in
+Declare a write-capable wrapper on `HandlerScope`, the way the built-in ops
+do — a source describes data, it does not change the outside world. A
+read-only wrapper goes on `RunScope` so it is usable in `validate`, in
 `items` and in the handler alike. Pass every write through `guardWrite` so
 dry-run, logging and report aggregation work out of the box; leave reads
 ungated. Build the handle with `shared(key) { … }` (§7.12) if a script would

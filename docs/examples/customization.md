@@ -75,7 +75,8 @@ class S3Ops internal constructor(
             .contents().map { it.key() }
 }
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
+// HandlerScope, а не RunScope: у S3Ops есть put/delete, значит это пишущая обёртка
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops = S3Ops(this, client, bucket)
 ```
 
 Используется обычно:
@@ -161,7 +162,7 @@ class S3Ops internal constructor(
 /** Ключ мемоизации: идентичность клиента плюс имя бакета. */
 private data class S3Key(val client: S3Client, val bucket: String)
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops =
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops =
     shared(S3Key(client, bucket)) { S3Ops(this, client, bucket) }
 ```
 
@@ -200,7 +201,7 @@ publish("crm.notify", args = mapOf("customerId" to c.id)) {
 Если у него callback-API, заверни сам:
 
 ```kotlin
-fun RunScope.crm(client: CrmClient): CrmOps = shared(client) { CrmOps(client) }
+fun HandlerScope.crm(client: CrmClient): CrmOps = shared(client) { CrmOps(client) }
 
 class CrmOps internal constructor(private val client: CrmClient) : AutoCloseable {
 

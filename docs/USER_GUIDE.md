@@ -2089,7 +2089,8 @@ class S3Ops(
     override fun close() { /* если есть что закрывать */ }
 }
 
-fun RunScope.s3(client: S3Client, bucket: String): S3Ops =
+// HandlerScope, а не RunScope: обёртка пишет, значит ей место в обработчике
+fun HandlerScope.s3(client: S3Client, bucket: String): S3Ops =
     shared(client to bucket) { S3Ops(this, client, bucket) }
 ```
 
