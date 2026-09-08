@@ -1,132 +1,153 @@
 package io.github.dsudomoin.migration.csv
 
 import com.fasterxml.jackson.dataformat.csv.CsvMapper
+import com.fasterxml.jackson.dataformat.csv.CsvParser
 import com.fasterxml.jackson.dataformat.csv.CsvSchema
-import io.github.dsudomoin.migration.RunScope
 import io.github.dsudomoin.migration.ItemError
+import io.github.dsudomoin.migration.MigrationScope
+import io.github.dsudomoin.migration.internal.MigrationRun
 import java.io.InputStream
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
 
 /**
- * Ленивое чтение CSV с header'ом. Возвращает `Sequence<T>` — стрим, материализуется по мере
- * итерации, подходит для миллионных файлов.
+ * Ленивое чтение CSV с заголовком. Строка приезжает в [map] как [CsvRow]; результат годится
+ * для миллионных файлов — файл не поднимается в память целиком.
  *
- * Каждая строка передаётся в [mapper] как `Map<String, String>` (ключ = имя колонки из header'а).
+ * [onRowError] применяется к каждой строке отдельно — и к разбору CSV, и к работе [map].
+ * Отброшенная строка считается в `sourceSkipped`, а не в `skipped`: до цикла она не дошла
+ * и никогда не была `processed`. Исключение — [CsvStructureException]: файл не той формы
+ * валит прогон при любой политике.
  *
- * @param path относительный/абсолютный путь к файлу. Под [classpath]=true — путь внутри ресурсов.
- * @param classpath если `true`, [path] резолвится через `Thread.contextClassLoader.getResourceAsStream`.
- *                  Уместно для test-fixture CSV. Default `false`.
- * @param onRowError что делать со строкой, которую не удалось разобрать или отобразить в `T`.
- *                   См. [readCsv] KDoc про политики.
+ * @param path путь к файлу или, при `classpath = true`, имя ресурса.
+ * @param classpath читать из ресурсов, а не с файловой системы.
+ * @param delimiter разделитель колонок: выгрузки из Excel в русской локали идут через `;`.
+ * @param quote символ кавычки вокруг значений, содержащих разделитель или перевод строки.
+ * @param charset кодировка файла (например `Charset.forName("windows-1251")`). BOM в начале
+ *                срезается в любом случае и, если он от UTF-16, задаёт кодировку сам.
  */
-fun <T> RunScope.readCsv(
+fun <T> MigrationScope.readCsv(
     path: String,
     classpath: Boolean = false,
-    onRowError: ItemError<Map<String, String>> = ItemError.Fail,
-    mapper: (Map<String, String>) -> T,
-): Sequence<T> = lazyCsvSequence(onRowError, mapper) {
+    delimiter: Char = ',',
+    quote: Char = '"',
+    charset: Charset = Charsets.UTF_8,
+    onRowError: ItemError<CsvRow> = ItemError.Fail,
+    map: (CsvRow) -> T,
+): Sequence<T> {
+    val run = this as MigrationRun
+    return csvSequence(run, delimiter, quote, charset, onRowError, map) {
+        openCsvStream(run, path, classpath)
+    }
+}
+
+internal fun openCsvStream(run: MigrationRun, path: String, classpath: Boolean): InputStream =
     if (classpath) {
         // contextClassLoader может быть null (system threads, кастомные пулы) — fallback на
-        // загрузчик нашего класса, он всегда есть.
-        val cl = Thread.currentThread().contextClassLoader ?: this::class.java.classLoader
-        cl.getResourceAsStream(path)
-            ?: error("Resource not found on classpath: $path")
+        // загрузчик нашего класса, он есть всегда.
+        val cl = Thread.currentThread().contextClassLoader ?: run.javaClass.classLoader
+        cl.getResourceAsStream(path) ?: error("Resource not found on classpath: $path")
     } else {
         Files.newInputStream(Path.of(path))
     }
-}
-
-/** Перегрузка с явным [Path] — для случаев, когда path уже посчитан (например, относительно [RunScope.outputFolder]). */
-fun <T> RunScope.readCsv(
-    path: Path,
-    onRowError: ItemError<Map<String, String>> = ItemError.Fail,
-    mapper: (Map<String, String>) -> T,
-): Sequence<T> = lazyCsvSequence(onRowError, mapper) { Files.newInputStream(path) }
 
 /**
- * Строит ленивую `Sequence<T>` поверх CSV. **Stream открывается только на первом `next()`** —
- * если пользователь забыл консьюмить (early return, `.take(0)`, exception до итерации), файловый
- * хендл не открывается.
+ * Поток открывается только на первом `next()` и сразу регистрируется в реестре прогона:
+ * `sequence { }` — это корутина, и при неполном потреблении (`take(n)`, ранний выход)
+ * она просто бросается — `use`-блок внутри неё не доигрывает и дескриптор утёк бы.
  *
- * Открытый stream сразу регистрируется в [RunScope]: `sequence { }` — это корутина, и
- * при неполном потреблении (`take(n)`, ранний выход, ошибка выше по стеку) она просто
- * бросается — `use`-блок внутри неё не доигрывает и дескриптор утёк бы. Реестр закроет его в
- * любом случае; повторный `close()` на уже закрытом потоке — no-op.
- *
- * [onRowError] применяется к КАЖДОЙ строке отдельно: и к разбору CSV, и к работе [mapper].
- * `Fail` (дефолт) — первая же плохая строка валит прогон. `Skip` / `Handle→Skip` — строка
- * аудитится в `errors.csv`, инкрементит `report.sourceSkipped` и не доходит до обработчика стадии.
- *
- * В аудит уезжает сама разобранная строка (`Map<String, String>`), иначе по `errors.csv`
- * невозможно понять, какая именно строка сломалась. Если в колонках есть чувствительные данные,
- * сократи представление: `errors.includeItem<Map<String, String>> { "id=" + it["id"] }`.
+ * Заголовок разбирается своими руками, а не через `CsvSchema.withHeader()`: так его видно
+ * до первой записи — есть где проверить коллизии имён и сверить колонки с ожиданиями.
  */
-private fun <T> RunScope.lazyCsvSequence(
-    onRowError: ItemError<Map<String, String>>,
-    mapper: (Map<String, String>) -> T,
+private fun <T> csvSequence(
+    run: MigrationRun,
+    delimiter: Char,
+    quote: Char,
+    charset: Charset,
+    onRowError: ItemError<CsvRow>,
+    map: (CsvRow) -> T,
     openStream: () -> InputStream,
 ): Sequence<T> = sequence {
-    val ctx = this@lazyCsvSequence
-    val csvMapper = CsvMapper()
-    val schema = CsvSchema.emptySchema().withHeader()
     openStream().use { stream ->
-        ctx.register(stream)
-        csvMapper.readerFor(Map::class.java).with(schema)
-            .readValues<Map<String, String>>(stream)
-            .use { iter ->
-                while (iter.hasNext()) {
-                    var value: T? = null
-                    var ok = false
-                    // Разобранная строка нужна аудиту: без неё в errors.csv уезжает пустой
-                    // itemRepr, и по файлу невозможно понять, на какой именно строке встало.
-                    var raw: Map<String, String>? = null
-                    try {
-                        // next() тоже под политикой: битая строка (рваные кавычки, лишние
-                        // колонки) — это ровно тот случай, ради которого пишут ItemError.Skip.
-                        raw = iter.next()
-                        value = mapper(raw)
-                        ok = true
-                    } catch (e: Throwable) {
-                        ctx.handleRowError(e, onRowError, raw)
-                    }
-                    if (ok) {
-                        @Suppress("UNCHECKED_CAST")
-                        yield(value as T)
-                    }
+        run.register(stream)
+        val reader = bomAwareReader(stream, charset)
+        rowReader(delimiter, quote).readValues<Array<String>>(reader).use { iter ->
+            if (!iter.hasNext()) return@use
+            val header = CsvHeader(iter.next().asList())
+
+            var lineNumber = 1L
+            while (iter.hasNext()) {
+                lineNumber++
+                var value: T? = null
+                var ok = false
+                // Разобранная строка нужна аудиту: без неё по errors.csv невозможно понять,
+                // какая именно строка сломалась.
+                var row: CsvRow? = null
+                try {
+                    val cells = iter.next()
+                    if (isBlankRow(cells)) continue
+                    row = CsvRow(lineNumber, header, cells.asList())
+                    value = map(row)
+                    ok = true
+                } catch (e: Throwable) {
+                    handleRowError(run, e, onRowError, row)
+                }
+                if (ok) {
+                    @Suppress("UNCHECKED_CAST")
+                    yield(value as T)
                 }
             }
+        }
     }
 }
 
-/**
- * Применяет [onRowError] к сбойной строке. `Fail` пробрасывает исходное исключение;
- * `Skip` аудитит строку и считает её в `report.sourceSkipped` — отдельно от item-skip'ов
- * стадии: такая строка никогда не была `processed`, и смешивать её со `skipped` значило бы
- * сломать тождество `processed = successful + skipped + failed`.
- */
-private fun RunScope.handleRowError(e: Throwable, onRowError: ItemError<Map<String, String>>, row: Map<String, String>?) {
+// ObjectMapper дорог в создании и потокобезопасен после настройки; ObjectReader иммутабелен.
+//
+// WRAP_AS_ARRAY обязателен: без него схема без объявленных колонок отвергает вторую ячейку
+// строки как «лишнюю» (Too many entries: expected at most 0) — а колонок мы заранее и не знаем.
+private val CSV_MAPPER = CsvMapper().apply { enable(CsvParser.Feature.WRAP_AS_ARRAY) }
+
+internal fun rowReader(delimiter: Char, quote: Char) =
+    CSV_MAPPER.readerFor(Array<String>::class.java).with(
+        CsvSchema.emptySchema()
+            .withColumnSeparator(delimiter)
+            .withQuoteChar(quote),
+    )
+
+// Хвостовая пустая строка — норма для выгрузок; считать её битой записью значило бы
+// сыпать в errors.csv на ровном месте.
+internal fun isBlankRow(cells: Array<String>): Boolean =
+    cells.isEmpty() || (cells.size == 1 && cells[0].isBlank())
+
+private fun handleRowError(
+    run: MigrationRun,
+    e: Throwable,
+    onRowError: ItemError<CsvRow>,
+    row: CsvRow?,
+) {
     if (e is InterruptedException) {
         Thread.currentThread().interrupt()
         throw e
     }
+    if (e is CsvStructureException) throw e
+
     val decision = try {
         when (onRowError) {
             is ItemError.Fail -> ItemError.Decision.Fail
             is ItemError.Skip -> ItemError.Decision.Skip
-            // Классификатор получает саму разобранную строку: без неё нельзя отличить битую запись
-            // от записи с недопустимым значением.
-            is ItemError.Handle -> onRowError.decide(e, row ?: emptyMap())
+            // Сломался сам разбор CSV — строки нет, и классификатору не с чем работать.
+            is ItemError.Handle -> if (row == null) ItemError.Decision.Fail else onRowError.decide(e, row)
         }
     } catch (classifierError: Throwable) {
-        // Та же семантика, что у классификатора элемента стадии: сбой классификатора становится
-        // основной ошибкой, исходная ошибка строки сохраняется в suppressed и попадает в аудит.
+        // Та же семантика, что у классификатора элемента: сбой классификатора становится
+        // основной ошибкой, а исходная уезжает в suppressed.
         classifierError.addSuppressed(e)
-        auditError(classifierError, row)
+        run.audit(classifierError, row)
         throw classifierError
     }
     if (decision == ItemError.Decision.Fail) throw e
 
-    auditError(e, row)
-    report.incSourceSkipped()
+    run.audit(e, row)
+    run.report.incSourceSkipped()
 }

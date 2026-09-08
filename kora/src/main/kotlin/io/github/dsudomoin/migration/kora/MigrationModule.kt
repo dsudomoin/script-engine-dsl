@@ -1,23 +1,20 @@
 package io.github.dsudomoin.migration.kora
 
-import io.github.dsudomoin.migration.MigrationDefinition
+import io.github.dsudomoin.migration.Migration
 import ru.tinkoff.kora.application.graph.All
 import ru.tinkoff.kora.common.Module
-import ru.tinkoff.kora.common.Tag
 import ru.tinkoff.kora.common.annotation.Root
 import ru.tinkoff.kora.config.common.Config
 import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor
 import java.util.Optional
-import java.util.concurrent.Executor
 
 /**
  * Kora-модуль, регистрирующий [MigrationRunner] в графе. Подключается через
  * `@KoraApp interface App : ..., MigrationModule` — и этого достаточно: секцию `migration`
  * модуль читает сам.
  *
- * Runner забирает все [Migration]-компоненты графа через `All<MigrationDefinition>` (т.е. достаточно
- * пометить пользовательский скрипт `@Component`). Опционально подхватывает кастомный `Executor`,
- * помеченный `@Tag(MigrationExecutor::class)` — иначе создаёт свой cached pool.
+ * Runner забирает все [Migration]-компоненты графа через `All<Migration>` (т.е. достаточно
+ * пометить пользовательский скрипт `@Component`).
  */
 @Module
 interface MigrationModule {
@@ -44,20 +41,18 @@ interface MigrationModule {
     @Root
     fun migrationRunner(
         config: MigrationConfig,
-        definitions: All<MigrationDefinition>,
-        @Tag(MigrationExecutor::class) executor: Optional<Executor>,
+        definitions: All<Migration>,
         exit: Optional<MigrationExit>,
     ): MigrationRunner {
         val handler = exit.orElse(null)
         val list = definitions.toList()
-        val pool = executor.orElse(null)
         // Без компонента [MigrationExit] runner завершает процесс сам — это штатный режим
         // одноразового скрипта. С компонентом код возврата уезжает в него: так граф можно
         // поднять в тесте, не убивая JVM.
         return if (handler == null) {
-            MigrationRunner(config, list, pool)
+            MigrationRunner(config, list)
         } else {
-            MigrationRunner(config, list, pool) { code -> handler.exit(code) }
+            MigrationRunner(config, list) { code -> handler.exit(code) }
         }
     }
 }

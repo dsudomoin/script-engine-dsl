@@ -1,13 +1,11 @@
 package io.github.dsudomoin.migration.example
 
-import io.github.dsudomoin.migration.MigrationDefinition
-import io.github.dsudomoin.migration.WriteOutcome
-import io.github.dsudomoin.migration.kora.DefaultsValues
+import io.github.dsudomoin.migration.Migration
+import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.kora.MigrationConfig
 import io.github.dsudomoin.migration.kora.MigrationConfigValues
 import io.github.dsudomoin.migration.kora.MigrationExit
 import io.github.dsudomoin.migration.kora.MigrationModule
-import io.github.dsudomoin.migration.migration
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -26,13 +24,13 @@ import java.util.concurrent.TimeUnit
 /**
  * Проверяет то, чего не видит ни один тест модуля `:kora`: **работает ли документированный
  * wire-up на настоящем графе Kora**. Остальные тесты конструируют `MigrationRunner` руками и
- * потому зелены даже когда компонент не попадает в граф, конфиг не резолвится или у поля конфига
- * нет экстрактора — а у пользователя приложение при этом либо не собирается, либо стартует и
- * молча ничего не делает.
+ * потому зелены даже когда компонент не попадает в граф, конфиг не резолвится или у поля
+ * конфига нет экстрактора — а у пользователя приложение при этом либо не собирается, либо
+ * стартует и молча ничего не делает.
  *
- * Модуль `:example` для этого и заведён: KSP-расширение конфига Kora не может сгенерировать
- * экстрактор в том же модуле, где он уже сгенерирован, поэтому потребителя надо изображать
- * отдельным модулем — что заодно ближе к реальности.
+ * Модуль `:example` для этого и заведён: KSP-расширение конфига Kora не может
+ * сгенерировать экстрактор в том же модуле, где он уже сгенерирован, поэтому потребителя
+ * надо изображать отдельным модулем — что заодно ближе к реальности.
  */
 @KoraApp
 interface ExampleTestApp : HoconConfigModule, MigrationModule
@@ -71,55 +69,32 @@ class TestExit : MigrationExit {
 }
 
 @Component
-class ParallelProbeMigration : MigrationDefinition {
-    override val name = "WIRE-UP-PARALLEL"
+class ParallelProbeMigration : Migration("WIRE-UP-PARALLEL") {
 
-    override fun plan() = migration(name = name, author = "test") {
-        // Барьер на четырёх участников — жёсткая проверка настоящего параллелизма. На пуле
-        // фиксированного размера в один поток он не соберётся и тест упадёт по таймауту. Тихая
-        // деградация «работает, просто в один поток» здесь недопустима.
+    override fun MigrationScope.run() {
+        Probe.sawDryRun = dryRun
+
+        // Барьер на четырёх участников — жёсткая проверка настоящего параллелизма. В один поток
+        // он не соберётся и тест упадёт по таймауту. Тихая деградация «работает, просто в один
+        // поток» здесь недопустима.
         val barrier = CyclicBarrier(4)
 
-        source(
-            parallel = 4,
-            items = {
-                Probe.sawDryRun = dryRun
-                (1..4).asSequence()
-            },
-        ) { n ->
+        each((1..4).toList(), parallel = 4) { n ->
             Probe.workerThreads.add(Thread.currentThread().name)
             barrier.await(20, TimeUnit.SECONDS)
             Probe.parallelismReached = true
-            write("probe.write", args = mapOf("n" to n)) {
-                Probe.written.add(n)
-                WriteOutcome.Applied
-            }
+            if (!dryRun) Probe.written.add(n)
         }
     }
 }
 
-/** Две параллельные стадии подряд: пул обязан выдержать обе, не залипнув между ними. */
+/** Два параллельных цикла подряд: пул обязан выдержать оба, не залипнув между ними. */
 @Component
-class NestedProbeMigration : MigrationDefinition {
-    override val name = "WIRE-UP-NESTED"
+class NestedProbeMigration : Migration("WIRE-UP-NESTED") {
 
-    override fun plan() = migration(name = name, author = "test") {
-        source(name = "outer", parallel = 2, items = { sequenceOf("a", "b") }) { outer ->
-            Probe.nestedSeen.add("${outer}1")
-        }
-        source(name = "inner", parallel = 2, items = { sequenceOf("a", "b") }) { outer ->
-            Probe.nestedSeen.add("${outer}2")
-        }
-    }
-}
-
-/** Пишет мимо `write { }` — под dry-run запись уходит в бой, и отчёт обязан это заметить. */
-@Component
-class UngatedProbeMigration : MigrationDefinition {
-    override val name = "WIRE-UP-UNGATED"
-
-    override fun plan() = migration(name = name, author = "test") {
-        source(items = { (1..3).asSequence() }) { n -> Probe.written.add(n) }
+    override fun MigrationScope.run() {
+        each(listOf("a", "b"), parallel = 2) { outer -> Probe.nestedSeen.add("${outer}1") }
+        each(listOf("a", "b"), parallel = 2) { outer -> Probe.nestedSeen.add("${outer}2") }
     }
 }
 
@@ -137,20 +112,20 @@ class KoraWireUpTest {
             .describedAs("runner обязан отработать при сборке графа и вернуть код возврата")
             .isEqualTo(0)
         assertThat(Probe.written)
-            .describedAs("план должен выполниться целиком")
+            .describedAs("тело миграции должно выполниться целиком")
             .containsExactlyInAnyOrder(1, 2, 3, 4)
         assertThat(Probe.sawDryRun)
-            .describedAs("migration.dryRun из конфига доезжает до контекста")
+            .describedAs("migration.dryRun из конфига доезжает до скоупа")
             .isFalse()
     }
 
     @Test
     @Timeout(60)
-    fun `source с parallel = 4 действительно занимает четыре потока`(@TempDir tmp: Path) {
+    fun `each с parallel = 4 действительно занимает четыре потока`(@TempDir tmp: Path) {
         runGraph(MigrationConfigValues(run = "WIRE-UP-PARALLEL", outputFolder = tmp.toString()))
 
         assertThat(Probe.parallelismReached)
-            .describedAs("барьер на четырёх участников собрался")
+            .describedAs("барьер на четырёх участниках собрался")
             .isTrue()
         assertThat(Probe.workerThreads)
             .describedAs("четыре одновременно работающих воркера — четыре разных потока")
@@ -159,7 +134,7 @@ class KoraWireUpTest {
 
     @Test
     @Timeout(60)
-    fun `две параллельные стадии подряд не встают в deadlock`(@TempDir tmp: Path) {
+    fun `два параллельных цикла подряд не встают в deadlock`(@TempDir tmp: Path) {
         runGraph(MigrationConfigValues(run = "WIRE-UP-NESTED", outputFolder = tmp.toString()))
 
         assertThat(Probe.exitCode).isEqualTo(0)
@@ -168,31 +143,16 @@ class KoraWireUpTest {
 
     @Test
     @Timeout(60)
-    fun `dryRun из конфига долетает до контекста и гейтит записи`(@TempDir tmp: Path) {
+    fun `dryRun из конфига долетает до скоупа`(@TempDir tmp: Path) {
         runGraph(MigrationConfigValues(run = "WIRE-UP-PARALLEL", dryRun = true, outputFolder = tmp.toString()))
 
         assertThat(Probe.sawDryRun)
-            .describedAs("проброс config.dryRun -> ctx.dryRun; регрессия здесь означает боевые записи под MIGRATION_DRY_RUN=true")
+            .describedAs("проброс config.dryRun -> scope.dryRun; регрессия здесь означает боевые записи под MIGRATION_DRY_RUN=true")
             .isTrue()
         assertThat(Probe.written)
-            .describedAs("под dry-run записи не выполняются")
+            .describedAs("миграция сама не пишет под dry-run")
             .isEmpty()
         assertThat(Probe.exitCode).isEqualTo(0)
-    }
-
-    @Test
-    @Timeout(60)
-    fun `dry-run без единой гейтнутой записи поднимает предупреждение в лог прогона`(@TempDir tmp: Path) {
-        runGraph(MigrationConfigValues(run = "WIRE-UP-UNGATED", dryRun = true, outputFolder = tmp.toString()))
-
-        assertThat(Probe.written)
-            .describedAs("запись мимо write { } под dry-run выполняется по-настоящему — это и есть ловушка")
-            .containsExactlyInAnyOrder(1, 2, 3)
-
-        val log = tmp.resolve("migration.log").toFile().readText()
-        assertThat(log)
-            .describedAs("единственный наблюдаемый признак забытого write { } должен быть громким")
-            .contains("intercepted 0 writes")
     }
 
     @Test
@@ -203,9 +163,17 @@ class KoraWireUpTest {
         assertThat(Probe.exitCode).isEqualTo(2)
     }
 
+    @Test
+    @Timeout(60)
+    fun `артефакты прогона ложатся в outputFolder`(@TempDir tmp: Path) {
+        runGraph(MigrationConfigValues(run = "WIRE-UP-NESTED", outputFolder = tmp.toString()))
+
+        assertThat(tmp.resolve("migration.log")).exists()
+    }
+
     /**
-     * Поднимает настоящий граф, подменив в нём только узел конфига. Подмена — штатный механизм
-     * Kora (`ApplicationGraphDraw.replaceNode`); он позволяет гонять сценарии с разными
+     * Поднимает настоящий граф, подменив в нём только узел конфига. Подмена — штатный
+     * механизм Kora (`ApplicationGraphDraw.replaceNode`); он позволяет гонять сценарии с разными
      * `migration.*` без отдельного `application.conf` на каждый.
      */
     private fun runGraph(config: MigrationConfig) {

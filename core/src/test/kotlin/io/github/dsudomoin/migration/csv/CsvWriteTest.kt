@@ -1,127 +1,188 @@
 package io.github.dsudomoin.migration.csv
 
-import io.github.dsudomoin.migration.internal.RunContext
+import io.github.dsudomoin.migration.Migration
+import io.github.dsudomoin.migration.MigrationScope
+import io.github.dsudomoin.migration.MigrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 class CsvWriteTest {
 
-    @Test
-    fun `openCsv - пишет header сразу и row дописывает`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
+    @TempDir
+    lateinit var tmp: Path
 
-        with(ctx) {
-            val csv = openCsv(out, "id", "status")
-            csv.row(1, "ok")
-            csv.row(2, "ok")
+    /** Запускает тело миграции и отдаёт handle наружу — чтобы проверять его после прогона. */
+    private fun runWriting(dryRun: Boolean = false, body: MigrationScope.() -> CsvOutput): CsvOutput {
+        var handle: CsvOutput? = null
+        val migration = object : Migration("CSV-WRITE") {
+            override fun MigrationScope.run() {
+                handle = body()
+            }
         }
-        ctx.closeRegistered()
-
-        val lines = Files.readAllLines(out)
-        assertThat(lines).containsExactly("id,status", "1,ok", "2,ok")
+        val outcome = MigrationTest.run(migration, outputFolder = tmp, dryRun = dryRun)
+        assertThat(outcome.failure).isNull()
+        return handle!!
     }
 
     @Test
-    fun `openCsv - header виден до первого row`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
-
-        with(ctx) { openCsv(out, "a", "b") }
-        // ничего не пишем, файл уже должен иметь header
-        val lines = Files.readAllLines(out)
-        assertThat(lines).containsExactly("a,b")
-    }
-
-    @Test
-    fun `dry-run - файл всё равно пишется`(@TempDir tmp: Path) {
-        val ctx = RunContext.test(dryRun = true)
-        val out = tmp.resolve("out.csv")
-
-        with(ctx) {
-            val csv = openCsv(out, "x")
-            csv.row(1)
+    fun `пишет header сразу, row дописывает`() {
+        runWriting {
+            csv("out.csv", "id", "status").also {
+                it.row(1, "ok")
+                it.row(2, "ok")
+            }
         }
-        ctx.closeRegistered()
 
-        assertThat(Files.exists(out)).isTrue()
-        assertThat(Files.readAllLines(out)).containsExactly("x", "1")
+        assertThat(Files.readAllLines(tmp.resolve("out.csv")))
+            .containsExactly("id,status", "1,ok", "2,ok")
     }
 
     @Test
-    fun `openCsv - регистрируется и закрывается через closeRegistered`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
+    fun `разделитель применяется и к заголовку, и к строкам`() {
+        runWriting {
+            csv("out.csv", "id", "status", delimiter = ';').also { it.row(1, "ok") }
+        }
 
-        val csv = with(ctx) { openCsv(out, "x") }
-        csv.row(1)
-        // ctx auto-close
-        ctx.closeRegistered()
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"))).containsExactly("id;status", "1;ok")
+    }
 
-        // после close - row бросает
-        assertThatThrownBy { csv.row(2) }
+    @Test
+    fun `квотирование идёт по своему разделителю, а не по запятой`() {
+        runWriting {
+            csv("out.csv", "id", "name", delimiter = ';').also {
+                it.row(1, "Иванов; ООО")
+                it.row(2, "Петров, ИП")
+            }
+        }
+
+        // Точка с запятой рвёт строку и потому квотируется; запятая при этом разделителем
+        // не является и остаётся обычным символом — иначе файл распухал бы кавычками впустую.
+        assertThat(Files.readAllLines(tmp.resolve("out.csv")))
+            .containsExactly("id;name", """1;"Иванов; ООО"""", "2;Петров, ИП")
+    }
+
+    @Test
+    fun `BOM пишется по запросу — Excel открывает кириллицу без бубна`() {
+        runWriting {
+            csv("out.csv", "имя", bom = true).also { it.row("Иван") }
+        }
+
+        val bytes = Files.readAllBytes(tmp.resolve("out.csv"))
+        assertThat(bytes.take(3)).containsExactly(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte())
+    }
+
+    @Test
+    fun `charset применяется к содержимому`() {
+        val cp1251 = Charset.forName("windows-1251")
+        runWriting {
+            csv("out.csv", "имя", charset = cp1251).also { it.row("Иван") }
+        }
+
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"), cp1251)).containsExactly("имя", "Иван")
+    }
+
+    @Test
+    fun `BOM в кодировке, которая его не умеет, отвергается до записи`() {
+        val migration = object : Migration("CSV-BOM-BAD") {
+            override fun MigrationScope.run() {
+                csv("out.csv", "имя", charset = Charset.forName("windows-1251"), bom = true)
+            }
+        }
+
+        val outcome = MigrationTest.run(migration, outputFolder = tmp)
+
+        // Иначе BOM молча уехал бы в файл вопросительным знаком и сломал первую колонку.
+        assertThat(outcome.failure).isInstanceOf(IllegalArgumentException::class.java)
+        assertThat(outcome.failure).hasMessageContaining("windows-1251")
+        assertThat(Files.exists(tmp.resolve("out.csv"))).isFalse()
+    }
+
+    @Test
+    fun `выход в чужом формате читается обратно своим же readCsv`() {
+        val cp1251 = Charset.forName("windows-1251")
+        runWriting {
+            csv("out.csv", "id", "name", delimiter = ';', charset = cp1251).also {
+                it.row(1, "Иванов; ООО")
+                it.row(2, "Пётр")
+            }
+        }
+
+        val seen = mutableListOf<String>()
+        val reader = object : Migration("CSV-ROUNDTRIP") {
+            override fun MigrationScope.run() {
+                readCsv(tmp.resolve("out.csv").toString(), delimiter = ';', charset = cp1251) { it["name"] }
+                    .forEach { seen += it }
+            }
+        }
+        assertThat(MigrationTest.run(reader, outputFolder = tmp.resolve("rt")).failure).isNull()
+        assertThat(seen).containsExactly("Иванов; ООО", "Пётр")
+    }
+
+    @Test
+    fun `header виден до первого row`() {
+        val migration = object : Migration("CSV-HEADER") {
+            override fun MigrationScope.run() {
+                csv("out.csv", "a", "b")
+                // Файл читается прямо внутри прогона: header флашится при открытии, а не на close.
+                assertThat(Files.readAllLines(outputFolder.resolve("out.csv"))).containsExactly("a,b")
+            }
+        }
+
+        assertThat(MigrationTest.run(migration, outputFolder = tmp).failure).isNull()
+    }
+
+    @Test
+    fun `под dry-run файл всё равно пишется`() {
+        runWriting(dryRun = true) {
+            csv("out.csv", "x").also { it.row(1) }
+        }
+
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"))).containsExactly("x", "1")
+    }
+
+    @Test
+    fun `после закрытия прогона row бросает`() {
+        val handle = runWriting { csv("out.csv", "x").also { it.row(1) } }
+
+        assertThatThrownBy { handle.row(2) }
             .isInstanceOf(IllegalStateException::class.java)
             .hasMessageContaining("closed")
     }
 
     @Test
-    fun `close идемпотентен - повторный вызов no-op`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
-        val csv = with(ctx) { openCsv(out, "x") }
-        csv.row(1)
+    fun `close идемпотентен`() {
+        val handle = runWriting { csv("out.csv", "x").also { it.row(1) } }
 
-        csv.close()
-        csv.close()
-        csv.close()
+        handle.close()
+        handle.close()
 
-        assertThat(Files.readAllLines(out)).containsExactly("x", "1")
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"))).containsExactly("x", "1")
     }
 
     @Test
-    fun `row thread-safe под параллельной записью`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
-        val csv = with(ctx) { openCsv(out, "thread", "n") }
-
-        val workers = 8
+    fun `row потокобезопасен под параллельной записью`() {
         val perWorker = 250
-        val expected = workers * perWorker
-        val written = AtomicInteger()
-
-        val pool = Executors.newFixedThreadPool(workers)
-        val start = CountDownLatch(1)
-        val done = CountDownLatch(workers)
-
-        repeat(workers) { id ->
-            pool.submit {
-                start.await()
-                repeat(perWorker) { i ->
-                    csv.row(id, i)
-                    written.incrementAndGet()
+        val workers = 8
+        val migration = object : Migration("CSV-PARALLEL") {
+            override fun MigrationScope.run() {
+                val out = csv("out.csv", "worker", "n")
+                each((1..workers).toList(), parallel = workers) { id ->
+                    repeat(perWorker) { i -> out.row(id, i) }
                 }
-                done.countDown()
             }
         }
-        start.countDown()
-        check(done.await(10, TimeUnit.SECONDS)) { "parallel row timed out" }
-        pool.shutdown()
-        check(pool.awaitTermination(5, TimeUnit.SECONDS))
-        ctx.closeRegistered()
 
-        val lines = Files.readAllLines(out)
-        assertThat(written.get()).isEqualTo(expected)
-        assertThat(lines.size).isEqualTo(expected + 1) // +header
-        assertThat(lines.first()).isEqualTo("thread,n")
-        // каждая строка валидна — два числовых поля, без "склеек" или ломаных строк
+        assertThat(MigrationTest.run(migration, outputFolder = tmp).failure).isNull()
+
+        val lines = Files.readAllLines(tmp.resolve("out.csv"))
+        assertThat(lines).hasSize(workers * perWorker + 1)
+        assertThat(lines.first()).isEqualTo("worker,n")
+        // Каждая строка цела: два числовых поля, без склеек и обрывов.
         lines.drop(1).forEach { line ->
             val parts = line.split(",")
             assertThat(parts).hasSize(2)
@@ -131,34 +192,28 @@ class CsvWriteTest {
     }
 
     @Test
-    fun `openCsv(filename) - резолвится в ctx outputFolder`(@TempDir tmp: Path) {
-        val ctx = RunContext.test(outputFolder = tmp)
-
-        with(ctx) {
-            val csv = openCsv("nested/sub/out.csv", "x", "y")
-            csv.row(1, 2)
-            csv.row(3, 4)
+    fun `вложенный путь создаёт промежуточные каталоги`() {
+        runWriting {
+            csv("nested/sub/out.csv", "x", "y").also {
+                it.row(1, 2)
+                it.row(3, 4)
+            }
         }
-        ctx.closeRegistered()
 
-        val target = tmp.resolve("nested/sub/out.csv")
-        assertThat(Files.exists(target)).isTrue()
-        assertThat(Files.readAllLines(target)).containsExactly("x,y", "1,2", "3,4")
+        assertThat(Files.readAllLines(tmp.resolve("nested/sub/out.csv")))
+            .containsExactly("x,y", "1,2", "3,4")
     }
 
     @Test
-    fun `escape - запятые, кавычки и переводы строк квотируются`(@TempDir tmp: Path) {
-        val ctx = RunContext.test()
-        val out = tmp.resolve("out.csv")
-
-        with(ctx) {
-            val csv = openCsv(out, "a", "b")
-            csv.row("plain", "with,comma")
-            csv.row("with\"quote", "with\nnewline")
+    fun `запятые, кавычки и переводы строк квотируются`() {
+        runWriting {
+            csv("out.csv", "a", "b").also {
+                it.row("plain", "with,comma")
+                it.row("with\"quote", "with\nnewline")
+            }
         }
-        ctx.closeRegistered()
 
-        val text = Files.readString(out)
+        val text = Files.readString(tmp.resolve("out.csv"))
         assertThat(text).contains("\"with,comma\"")
         assertThat(text).contains("\"with\"\"quote\"")
         assertThat(text).contains("\"with\nnewline\"")

@@ -12,15 +12,15 @@ import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Авто-аудитор item-уровневых ошибок. Пишет CSV-строку в [errorsFile] и стектрейс в [tracesFile]
- * для каждой ошибки, прошедшей через `ItemError.Skip` / `Handle→Skip` в стадии.
+ * Авто-аудитор ошибок элемента. Пишет CSV-строку в [errorsFile] и стектрейс в [tracesFile]
+ * для каждой ошибки, прошедшей через `ItemError.Skip` / `Handle→Skip` в цикле `each`.
  *
  * Файлы создаются лениво (на первой ошибке) — если миграция пройдёт без ошибок, файлов не будет.
- * Доступен на [io.github.dsudomoin.migration.RunScope.errors]; пользователь обычно вызывает только
- * [includeItem] для per-type сериализации, всё остальное — автоматика.
+ * Доступен на [io.github.dsudomoin.migration.MigrationScope.errors]; пользователь обычно вызывает
+ * только [includeItem] для per-type сериализации, всё остальное — автоматика.
  *
  * **Thread-safe.** [report] и [registerSerializer] безопасно вызывать из параллельных воркеров
- * стадии. [includeItem] фактически делегирует в [registerSerializer].
+ * цикла. [includeItem] фактически делегирует в [registerSerializer].
  *
  * @param maxItemReprLength максимальная длина строки `itemRepr` в CSV. Длинные значения
  *                          обрезаются с `...`. Дефолт 500.
@@ -28,7 +28,6 @@ import java.util.concurrent.ConcurrentHashMap
  */
 open class CsvFileErrorReporter(
     private val migrationName: String,
-    private val author: String,
     val errorsFile: Path,
     val tracesFile: Path,
     private val maxItemReprLength: Int = 500,
@@ -63,7 +62,7 @@ open class CsvFileErrorReporter(
      * Lookup в [report] идёт сначала точно по классу, потом по супертипам и интерфейсам —
      * `includeItem<Map>` сработает и для `LinkedHashMap`.
      *
-     * **Регистрируй сериализаторы в `validate { }` или в `items { }`, до первой обработки.** Метод thread-safe,
+     * **Регистрируй сериализаторы в начале `run()`, до первого цикла.** Метод thread-safe,
      * но регистрация во время параллельной обработки (когда воркеры уже могли закешировать
      * resolved-сериализаторы) приводит к инвалидации кэша и transient cache miss — корректность
      * не страдает, но рендеринг item'а в `errors.csv` может на нескольких записях пойти через
@@ -77,8 +76,8 @@ open class CsvFileErrorReporter(
     }
 
     /**
-     * Записать ошибку в `errors.csv` + (опционально) стектрейс в `errors.log`. Уже вызывается
-     * автоматически интерпретатором плана и [io.github.dsudomoin.migration.RunScope.auditError].
+     * Записать ошибку в `errors.csv` + (опционально) стектрейс в `errors.log`. Вызывается
+     * движком автоматически на каждой ошибке элемента.
      *
      * **Thread-safe, сериализуется через общий lock.** Все воркеры пишут в общий файл через
      * `synchronized(writeLock)`. На типичном error rate (десятки в минуту) это незаметно; если
@@ -86,7 +85,7 @@ open class CsvFileErrorReporter(
      * Mitigation: подними `errorThreshold`, чтобы массовые SKIP-ы вообще прерывали миграцию.
      *
      * `open` — переопределяй в тестах (например, чтобы симулировать падающий аудитор и
-     * проверить, что `ForEachEngine` ловит ошибку аудита в warning, не подменяя original).
+     * проверить, что цикл ловит ошибку аудита в warning, не подменяя исходную).
      */
     override fun report(e: Throwable, item: Any?) {
         val ts = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
@@ -98,7 +97,7 @@ open class CsvFileErrorReporter(
         synchronized(writeLock) {
             if (closed) return
             val csv = ensureCsv()
-            appendCsvRow(csv, ts, migrationName, author, itemRepr, errorClass, errorMessage)
+            appendCsvRow(csv, ts, migrationName, itemRepr, errorClass, errorMessage)
             if (trace != null) {
                 val log = ensureLog()
                 log.write("[$ts] [$migrationName] item=$itemRepr\n")
@@ -154,7 +153,7 @@ open class CsvFileErrorReporter(
         // (FileAppender.isAppend = false в MigrationRunner) и пользовательскими `openCsv`-файлами:
         // один прогон = один свежий набор артефактов.
         val w = Files.newBufferedWriter(errorsFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-        w.write("timestamp,migration,author,itemRepr,errorClass,errorMessage")
+        w.write("timestamp,migration,itemRepr,errorClass,errorMessage")
         w.newLine()
         csvWriter = w
         return w

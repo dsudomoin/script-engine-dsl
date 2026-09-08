@@ -14,7 +14,10 @@ base { archivesName.set("migration-dsl-core") }
 dependencies {
     api(libs.kotlin.stdlib)
     api(libs.slf4j.api)
+    implementation(libs.kotlin.reflect)
     implementation(libs.jackson.csv)
+    implementation(libs.jackson.kotlin)
+    implementation(libs.jackson.jsr310)
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
