@@ -2,7 +2,7 @@ package io.github.dsudomoin.migration.error
 
 /**
  * Контракт авто-аудитора item-уровневых ошибок. Дефолтная реализация — [CsvFileErrorReporter]
- * (пишет в `errors.csv` + `errors.log` под [io.github.dsudomoin.migration.RunScope.outputFolder]).
+ * (пишет в `errors.csv` + `errors.log` под [io.github.dsudomoin.migration.MigrationScope.outputFolder]).
  *
  * Пользователь может подменить дефолт своей реализацией для интеграции с Sentry, Kibana,
  * JSON Lines, и т.д. — для этого пишет свой `ErrorReporter` и подключает через кастомный
@@ -13,9 +13,8 @@ package io.github.dsudomoin.migration.error
  */
 interface ErrorReporter : AutoCloseable {
     /**
-     * Записать ошибку. Уже вызывается автоматически интерпретатором плана через
-     * [io.github.dsudomoin.migration.RunScope.auditError]. Пользовательский прямой вызов нужен только
-     * для ad-hoc отчётности.
+     * Записать ошибку. Вызывается движком автоматически на каждой ошибке элемента.
+     * Пользовательский прямой вызов нужен только для ad-hoc отчётности.
      */
     fun report(e: Throwable, item: Any?)
 
@@ -30,9 +29,7 @@ interface ErrorReporter : AutoCloseable {
 
 /**
  * Регистрация сериализатора по типу [T]. Эквивалент `registerSerializer(T::class.java) { f(it as T) }`.
- * Регистрировать удобнее всего в `validate { }`: он выполняется один раз, до всех стадий.
- * В `items { }` тоже можно, но в `scoped`-стадии эта лямбда вызывается на КАЖДОГО родителя,
- * то есть регистрация повторится столько же раз (она идемпотентна, но бессмысленна).
+ * Регистрировать удобнее всего в первых строках `run()` — до первого цикла `each`.
  * ```
  * errors.includeItem<Customer> { "id=${it.id}, status=${it.status}" }
  * ```

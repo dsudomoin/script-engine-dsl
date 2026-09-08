@@ -1,7 +1,6 @@
 package io.github.dsudomoin.migration.csv
 
 import io.github.dsudomoin.migration.MigrationScope
-import io.github.dsudomoin.migration.RunScope
 import io.github.dsudomoin.migration.internal.MigrationRun
 import java.io.BufferedWriter
 import java.nio.file.Files
@@ -10,8 +9,8 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 
 /**
- * Handle для записи CSV-output'а. Создаётся через [openCsv]. Регистрируется в [RunScope]
- * как [AutoCloseable] — закрывается runner'ом после исполнения плана, в обратном порядке регистрации.
+ * Handle для записи CSV-выхода. Создаётся через [csv] и закрывается движком в конце прогона,
+ * в обратном порядке открытия.
  *
  * Методы:
  * - [row] thread-safe (можно вызывать из параллельных воркеров стадии).
@@ -82,19 +81,6 @@ private class CsvOutputImpl(
 }
 
 /**
- * Открывает CSV-файл по абсолютному [path], пишет header сразу, возвращает [CsvOutput] handle.
- * Регистрирует его в [RunScope] — runner закроет в `finally`.
- *
- * Поведение:
- * - `mkdir -p` на parent-папку.
- * - `CREATE + TRUNCATE_EXISTING` — файл перезаписывается при ререн-е миграции.
- * - Под dry-run файл **всё равно создаётся** и пишется. Это решение спеки (см. v0.1.0 §4.1):
- *   `--dry-run` остаётся диагностическим артефактом.
- */
-fun RunScope.openCsv(path: Path, vararg headers: String): CsvOutput =
-    openCsvFile(path, headers.toList()).also { register(it) }
-
-/**
  * Открыть файл и написать заголовок. Без регистрации в реестре прогона: кто открыл,
  * тот и решает, кто закроет.
  *
@@ -145,13 +131,3 @@ fun MigrationScope.csv(filename: String, vararg headers: String): CsvOutput {
         openCsvFile(outputFolder.resolve(normalized), headers.toList())
     }
 }
-
-/**
- * Открывает CSV-файл с именем [filename] относительно [RunScope.outputFolder].
- * Самый частый случай — `openCsv("processed.csv", "id", "status")`.
- *
- * Поддерживает вложенные пути (`openCsv("nested/sub/out.csv", ...)`) — промежуточные каталоги
- * создадутся через `mkdir -p`.
- */
-fun RunScope.openCsv(filename: String, vararg headers: String): CsvOutput =
-    openCsv(outputFolder.resolve(filename), *headers)

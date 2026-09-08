@@ -23,10 +23,13 @@ import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor
 @ConfigValueExtractor
 interface MigrationConfig {
 
-    /** Имя миграции к запуску (совпадает с [io.github.dsudomoin.migration.MigrationDefinition.name]). `null` = idle. */
+    /** Имя миграции к запуску (совпадает с [io.github.dsudomoin.migration.Migration.name]). `null` = idle. */
     fun run(): String?
 
-    /** `true` — все write'ы через `guardWrite` пропускаются, в отчёт идёт breakdown. */
+    /**
+     * Режим репетиции: значение видно в `MigrationScope.dryRun`. Библиотека ничего не
+     * перехватывает — пропустить запись обязана сама миграция: `if (!dryRun) ...`.
+     */
     fun dryRun(): Boolean = false
 
     /**

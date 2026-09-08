@@ -48,10 +48,9 @@ object MigrationExecution {
         Files.deleteIfExists(errorsFile)
         Files.deleteIfExists(traceFile)
 
-        val report = ReportBuilder(migration.name, "", settings.dryRun)
+        val report = ReportBuilder(migration.name, settings.dryRun)
         val reporter = CsvFileErrorReporter(
             migration.name,
-            "",
             errorsFile,
             traceFile,
             maxItemReprLength = settings.maxItemReprLength,

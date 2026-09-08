@@ -362,11 +362,10 @@ class MigrationRun internal constructor(
                 outputFolder = outputFolder,
                 errors = CsvFileErrorReporter(
                     name,
-                    "test",
                     outputFolder.resolve("errors.csv"),
                     outputFolder.resolve("errors.log"),
                 ),
-                report = ReportBuilder(name, "test", dryRun),
+                report = ReportBuilder(name, dryRun),
                 name = name,
                 defaultProgressEvery = progressEvery,
                 defaultErrorThreshold = errorThreshold,
