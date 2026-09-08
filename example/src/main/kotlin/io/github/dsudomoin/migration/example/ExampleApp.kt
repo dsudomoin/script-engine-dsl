@@ -30,8 +30,8 @@ fun main() {
 
 /**
  * Стенд-ин вместо настоящего репозитория: пишет строки в TSV-файл. Важна не реализация, а то,
- * что это **обычный компонент графа**, о котором DSL ничего не знает — значит его вызовы не
- * перехватываются dry-run-гейтом автоматически и должны быть обёрнуты в `mutation { }`.
+ * что это **обычный компонент графа**, о котором библиотека ничего не знает: под dry-run
+ * его вызов выполнится по-настоящему, если миграция не проверит флаг сама.
  */
 @Component
 class CustomerTierRepository {
@@ -44,7 +44,7 @@ class CustomerTierRepository {
         Files.write(file, ByteArray(0), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
     }
 
-    /** Запись «в БД». Синхронизация нужна: `forEach` зовёт это из нескольких потоков сразу. */
+    /** Запись «в БД». Синхронизация нужна: `each(parallel = 4)` зовёт это из четырёх потоков. */
     @Synchronized
     fun updateTier(customerId: Long, tier: String) {
         Files.write(

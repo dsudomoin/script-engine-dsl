@@ -1,6 +1,6 @@
 package io.github.dsudomoin.migration.kora
 
-import io.github.dsudomoin.migration.MigrationDefinition
+import io.github.dsudomoin.migration.Migration
 import ru.tinkoff.kora.application.graph.All
 import ru.tinkoff.kora.common.Module
 import ru.tinkoff.kora.common.annotation.Root
@@ -13,7 +13,7 @@ import java.util.Optional
  * `@KoraApp interface App : ..., MigrationModule` — и этого достаточно: секцию `migration`
  * модуль читает сам.
  *
- * Runner забирает все [Migration]-компоненты графа через `All<MigrationDefinition>` (т.е. достаточно
+ * Runner забирает все [Migration]-компоненты графа через `All<Migration>` (т.е. достаточно
  * пометить пользовательский скрипт `@Component`).
  */
 @Module
@@ -41,7 +41,7 @@ interface MigrationModule {
     @Root
     fun migrationRunner(
         config: MigrationConfig,
-        definitions: All<MigrationDefinition>,
+        definitions: All<Migration>,
         exit: Optional<MigrationExit>,
     ): MigrationRunner {
         val handler = exit.orElse(null)

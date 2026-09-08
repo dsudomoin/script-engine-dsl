@@ -1,6 +1,5 @@
 package io.github.dsudomoin.migration.kora
 
-import io.github.dsudomoin.migration.ScriptPolicy
 import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor
 
 /**
@@ -39,7 +38,7 @@ interface MigrationConfig {
      */
     fun outputFolder(): String?
 
-    /** Дефолты для стадий, порога ошибок и unhandled-policy. */
+    /** Дефолты прогона: порог ошибок и период прогресса. */
     fun defaults(): Defaults
 
     /** Тонкая настройка авто-аудитора. Пути файлов выводятся из [outputFolder]. */
@@ -52,21 +51,11 @@ interface MigrationConfig {
     @ConfigValueExtractor
     interface Defaults {
 
-        /** Политика для исключений, вышедших за пределы стадий (см. [ScriptPolicy]). */
-        fun onUnhandled(): ScriptPolicy = ScriptPolicy.FAIL_FAST
-
-        /** Если `skipped > threshold` — прервать прогон с exit 1. `0` = отключено. */
+        /** Если `skipped > threshold` в одном цикле — прервать прогон с exit 1. `0` = отключено. */
         fun errorThreshold(): Long = 0
 
         /** Период дефолтного `Progress.Default` логгера. */
         fun progressEvery(): Int = 1000
-
-        /**
-         * Значение аргумента `parallel` у стадии, если он не указан явно. Реальный
-         * параллелизм каждого цикла задаёт его собственный аргумент; пул runner'а cached и
-         * подстраивается под запрошенное число воркеров.
-         */
-        fun parallel(): Int = 1
     }
 
     /** Настройка авто-аудитора ошибок. */
@@ -111,15 +100,11 @@ data class MigrationConfigValues(
 
 /** Программная реализация [MigrationConfig.Defaults]. */
 data class DefaultsValues(
-    private val onUnhandled: ScriptPolicy = ScriptPolicy.FAIL_FAST,
     private val errorThreshold: Long = 0,
     private val progressEvery: Int = 1000,
-    private val parallel: Int = 1,
 ) : MigrationConfig.Defaults {
-    override fun onUnhandled(): ScriptPolicy = onUnhandled
     override fun errorThreshold(): Long = errorThreshold
     override fun progressEvery(): Int = progressEvery
-    override fun parallel(): Int = parallel
 }
 
 /** Программная реализация [MigrationConfig.ErrorReporting]. */
