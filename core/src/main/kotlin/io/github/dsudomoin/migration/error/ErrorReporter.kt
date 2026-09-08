@@ -4,12 +4,11 @@ package io.github.dsudomoin.migration.error
  * Контракт авто-аудитора item-уровневых ошибок. Дефолтная реализация — [CsvFileErrorReporter]
  * (пишет в `errors.csv` + `errors.log` под [io.github.dsudomoin.migration.MigrationScope.outputFolder]).
  *
- * Пользователь может подменить дефолт своей реализацией для интеграции с Sentry, Kibana,
- * JSON Lines, и т.д. — для этого пишет свой `ErrorReporter` и подключает через кастомный
- * `internalCreate` (см. `customization.md`).
+ * Подменить дефолт (Sentry, Kibana, JSON Lines) можно, собрав прогон самому через
+ * `MigrationExecution.execute` со своей реализацией — см. `docs/examples/customization.md`.
  *
- * Реализации должны быть thread-safe: [report] и [registerSerializer] могут вызываться из
- * параллельных воркеров стадии.
+ * Реализации обязаны быть потокобезопасными: [report] и [registerSerializer] зовутся из
+ * параллельных воркеров цикла.
  */
 interface ErrorReporter : AutoCloseable {
     /**

@@ -74,6 +74,10 @@ interface MigrationScope {
     /**
      * Перегрузка для коллекций: репозитории возвращают `List`, и требовать от каждой
      * миграции `.asSequence()` значило бы добавлять шум ради типов.
+     *
+     * У коллекции известен размер, поэтому прогресс здесь показывает долю
+     * (`progress: 300/1200 (25%)`) и сам укорачивает шаг на коротких циклах. У [Sequence]
+     * размера нет, и прогресс ограничивается счётчиком.
      */
     fun <T> each(
         items: Iterable<T>,
@@ -82,5 +86,5 @@ interface MigrationScope {
         progress: Progress = Progress.Default,
         errorThreshold: Long? = null,
         handle: (T) -> Unit,
-    ): EachResult = each(items.asSequence(), parallel, onItemError, progress, errorThreshold, handle)
+    ): EachResult
 }

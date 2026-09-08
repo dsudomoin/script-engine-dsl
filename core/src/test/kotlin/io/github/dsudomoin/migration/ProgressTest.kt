@@ -157,3 +157,42 @@ class ProgressTest {
         assertThat(lines[0]).contains("progress: 1000/10000")
     }
 }
+
+/**
+ * Прогресс со стороны миграции: `total` попадает в тикер только у коллекции.
+ *
+ * Проверяется через [Progress.Custom] — единственный публичный способ увидеть, что движок
+ * передал тикеру. Раньше `each` всегда передавал `null`, и вся работа тикера с долей и
+ * укороченным шагом была мертва в бою, хотя и покрыта юнит-тестами.
+ */
+class ProgressTotalTest {
+
+    @org.junit.jupiter.api.io.TempDir
+    lateinit var tmp: java.nio.file.Path
+
+    private fun totalSeenBy(body: MigrationScope.(Progress) -> Unit): Long? {
+        var seen: Long? = -1L
+        val probe = Progress.Custom(1) { _, total -> seen = total; "tick" }
+        val migration = object : Migration("PROGRESS-TOTAL") {
+            override fun MigrationScope.run() = body(probe)
+        }
+        assertThat(MigrationTest.run(migration, outputFolder = tmp).failure).isNull()
+        return seen
+    }
+
+    @Test
+    fun `цикл по коллекции знает её размер`() {
+        assertThat(totalSeenBy { p -> each(listOf(1, 2, 3), progress = p) { } }).isEqualTo(3L)
+    }
+
+    @Test
+    fun `у Sequence размера нет`() {
+        assertThat(totalSeenBy { p -> each(sequenceOf(1, 2, 3), progress = p) { } }).isNull()
+    }
+
+    @Test
+    fun `у Iterable без размера тоже нет`() {
+        val notACollection = Iterable { listOf(1, 2, 3).iterator() }
+        assertThat(totalSeenBy { p -> each(notACollection, progress = p) { } }).isNull()
+    }
+}

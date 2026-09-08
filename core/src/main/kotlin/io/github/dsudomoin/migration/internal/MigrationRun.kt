@@ -69,12 +69,44 @@ class MigrationRun internal constructor(
         progress: Progress,
         errorThreshold: Long?,
         handle: (T) -> Unit,
+    ): EachResult = each(items, null, parallel, onItemError, progress, errorThreshold, handle)
+
+    /**
+     * `Collection` знает свой размер, и это единственное место, где движок может его узнать:
+     * `Iterable` в общем случае одноразовый, а `Sequence` тем более — считать элементы заранее
+     * значило бы прочитать источник дважды.
+     */
+    override fun <T> each(
+        items: Iterable<T>,
+        parallel: Int,
+        onItemError: ItemError<T>,
+        progress: Progress,
+        errorThreshold: Long?,
+        handle: (T) -> Unit,
+    ): EachResult = each(
+        items.asSequence(),
+        (items as? Collection<T>)?.size?.toLong(),
+        parallel,
+        onItemError,
+        progress,
+        errorThreshold,
+        handle,
+    )
+
+    private fun <T> each(
+        items: Sequence<T>,
+        total: Long?,
+        parallel: Int,
+        onItemError: ItemError<T>,
+        progress: Progress,
+        errorThreshold: Long?,
+        handle: (T) -> Unit,
     ): EachResult {
         require(parallel > 0) { "parallel must be > 0, got $parallel" }
         val threshold = errorThreshold ?: defaultErrorThreshold
         val ticker = ProgressTicker(
             mode = progress,
-            total = null,
+            total = total,
             defaultEvery = defaultProgressEvery,
             sink = { log.info(it) },
         )
