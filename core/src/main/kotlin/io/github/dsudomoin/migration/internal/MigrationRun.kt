@@ -5,6 +5,7 @@ import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.Migration
 import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.Progress
+import io.github.dsudomoin.migration.csv.CsvOutput
 import io.github.dsudomoin.migration.error.CsvFileErrorReporter
 import io.github.dsudomoin.migration.error.ErrorReporter
 import io.github.dsudomoin.migration.report.ReportBuilder
@@ -12,6 +13,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -47,6 +49,7 @@ class MigrationRun internal constructor(
     private val stateLock = Any()
     private val resources = ArrayDeque<AutoCloseable>()
     private var closed = false
+    private val outputs = ConcurrentHashMap<String, CsvOutput>()
 
     @Volatile
     private var pool: ExecutorService? = null
@@ -205,12 +208,12 @@ class MigrationRun internal constructor(
             // Сбой классификатора не имеет права проглотить отказ элемента: исходная ошибка
             // уходит в suppressed, и оба конца видны в errors.csv.
             classifierError.addSuppressed(e)
-            safeAudit(classifierError, item)
+            audit(classifierError, item)
             report.incFailed()
             counters.failed.incrementAndGet()
             throw classifierError
         }
-        safeAudit(e, item)
+        audit(e, item)
         when (decision) {
             ItemError.Decision.Skip -> {
                 report.incSkipped()
@@ -228,8 +231,19 @@ class MigrationRun internal constructor(
         }
     }
 
-    // Аудитор может упасть сам (кончился диск) — терять из-за этого исходную ошибку нельзя.
-    private fun safeAudit(e: Throwable, item: Any?) {
+    /**
+     * Выход по имени: один файл — один handle на весь прогон.
+     *
+     * В императивном теле вызов `csv(...)` легко оказывается внутри цикла, и переоткрытие
+     * файла на каждой итерации затирало бы написанное раньше.
+     */
+    fun csvOutput(key: String, factory: () -> CsvOutput): CsvOutput =
+        outputs.computeIfAbsent(key) { factory().also { register(it) } }
+
+    /**
+     * Записать ошибку в `errors.csv`, не потеряв её, если сам аудитор упал (кончился диск).
+     */
+    fun audit(e: Throwable, item: Any?) {
         try {
             errors.report(e, item)
         } catch (auditError: Throwable) {

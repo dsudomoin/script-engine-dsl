@@ -1,8 +1,11 @@
 package io.github.dsudomoin.migration.csv
 
+import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.RunScope
+import io.github.dsudomoin.migration.internal.MigrationRun
 import java.io.BufferedWriter
 import java.nio.file.Files
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 
@@ -88,17 +91,59 @@ private class CsvOutputImpl(
  * - Под dry-run файл **всё равно создаётся** и пишется. Это решение спеки (см. v0.1.0 §4.1):
  *   `--dry-run` остаётся диагностическим артефактом.
  */
-fun RunScope.openCsv(path: Path, vararg headers: String): CsvOutput {
+fun RunScope.openCsv(path: Path, vararg headers: String): CsvOutput =
+    openCsvFile(path, headers.toList()).also { register(it) }
+
+/**
+ * Открыть файл и написать заголовок. Без регистрации в реестре прогона: кто открыл,
+ * тот и решает, кто закроет.
+ *
+ * Заголовки квотируются по RFC 4180 — имя колонки вроде `"Order ID, total"` иначе
+ * превратилось бы в две колонки вместо одной.
+ */
+internal fun openCsvFile(path: Path, headers: List<String>): CsvOutput {
     Files.createDirectories(path.parent ?: Path.of("."))
     val w = Files.newBufferedWriter(path, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-    // Заголовки тоже квотируем по RFC 4180 — на случай, если кто-то передаст "Order ID, total"
-    // (с запятой). Без escape header превратился бы в три колонки вместо двух, парсинг ломается.
     w.write(headers.joinToString(",") { csvEscape(it) })
     w.newLine()
     w.flush()
-    val out = CsvOutputImpl(path, w)
-    register(out)
-    return out
+    return CsvOutputImpl(path, w)
+}
+
+/**
+ * Имена, которые движок открывает в `outputFolder` сам.
+ *
+ * Пользовательский выход с таким именем писал бы в тот же файл параллельно с аудитором
+ * или файловым логгером, а оба открывают его с `TRUNCATE_EXISTING` — то есть аудит прогона
+ * молча уничтожался бы ровно там, где он нужнее всего.
+ */
+private val RESERVED_ARTIFACTS = setOf("errors.csv", "errors.log", "migration.log")
+
+/**
+ * CSV-выход прогона: отчёты, экспорты, диагностика. Файл открывается в `outputFolder`
+ * один раз на имя и закрывается движком в конце прогона.
+ *
+ * Повторный вызов с тем же [filename] возвращает тот же handle — см. [MigrationRun.csvOutput].
+ *
+ * Под dry-run файл всё равно пишется: выход — диагностический артефакт, а не изменение
+ * целевой системы.
+ */
+fun MigrationScope.csv(filename: String, vararg headers: String): CsvOutput {
+    val run = this as MigrationRun
+    val normalized = try {
+        Path.of(filename).normalize()
+    } catch (e: InvalidPathException) {
+        throw IllegalArgumentException("csv '$filename' is not a valid path", e)
+    }
+    require(!normalized.isAbsolute && !normalized.startsWith("..")) {
+        "csv '$filename' must stay inside the migration outputFolder"
+    }
+    require(normalized.toString() !in RESERVED_ARTIFACTS) {
+        "csv '$filename' uses a reserved engine artifact name: $RESERVED_ARTIFACTS"
+    }
+    return run.csvOutput(normalized.toString()) {
+        openCsvFile(outputFolder.resolve(normalized), headers.toList())
+    }
 }
 
 /**
