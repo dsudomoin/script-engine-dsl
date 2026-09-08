@@ -48,7 +48,11 @@ class CsvBindTest {
         val seen = mutableListOf<T>()
         val migration = object : Migration("BIND") {
             override fun MigrationScope.run() {
-                readCsvAs<T>(file.toString(), onRowError = onRowError).forEach { seen += it }
+                // streaming: этот класс проверяет сборку строки в объект. Предпроверка целого
+                // файла — предмет CsvPrevalidationTest, и здесь она только прятала бы,
+                // на какой именно строке ломается разбор.
+                readCsvAs<T>(file.toString(), onRowError = onRowError, streaming = true)
+                    .forEach { seen += it }
             }
         }
         val outcome = MigrationTest.run(migration, outputFolder = tmp.resolve("out"))

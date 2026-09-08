@@ -1,5 +1,7 @@
 package io.github.dsudomoin.migration.csv
 
+import io.github.dsudomoin.migration.MigrationPrecondition
+
 /**
  * Одна строка входного файла. Доступ к ячейкам — по имени колонки, без учёта регистра
  * и способа записи: `spend_amount`, `SPEND_AMOUNT` и `spendAmount` — одна и та же колонка.
@@ -58,7 +60,8 @@ class CsvRow internal constructor(
  * `ItemError.Skip` превратил бы прогон в тихий пустой. `require(...)` в теле маппера
  * бросает обычный [IllegalArgumentException] и политике по-прежнему подчиняется.
  */
-class CsvStructureException internal constructor(message: String) : IllegalArgumentException(message)
+class CsvStructureException internal constructor(message: String) :
+    IllegalArgumentException(message), MigrationPrecondition
 
 /**
  * Заголовок файла: исходные имена плюс индекс для поиска, нечувствительного к регистру

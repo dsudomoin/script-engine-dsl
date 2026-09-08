@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.FileAppender
 import io.github.dsudomoin.migration.Migration
 import io.github.dsudomoin.migration.MigrationExecution
+import io.github.dsudomoin.migration.MigrationPrecondition
 import io.github.dsudomoin.migration.RunSettings
 import io.github.dsudomoin.migration.report.MigrationReport
 import io.github.dsudomoin.migration.report.ReportFormatter
@@ -32,8 +33,9 @@ import kotlin.system.exitProcess
  * - `0` — прогон завершён, изменения применены;
  * - `1` — исключение из тела миграции, превышенный порог ошибок или прерывание;
  *   состояние системы может быть частичным;
- * - `2` — мисконфиг: неизвестное имя, дублирующиеся имена, битые значения конфига,
- *   недоступный `outputFolder`. Ни один эффект не выполнен.
+ * - `2` — прогон забракован до первого элемента: неизвестное имя, дублирующиеся имена,
+ *   битые значения конфига, недоступный `outputFolder`, отвергнутый входной файл
+ *   ([MigrationPrecondition]). Ни один эффект не выполнен.
  *
  * @param onReport инжекция для тестов: готовый отчёт до того, как он уйдёт в лог.
  * @param exit инжекция для тестов — по умолчанию `System.exit`. Стоит последним намеренно:
@@ -105,6 +107,13 @@ class MigrationRunner(
             log.info("\n" + ReportFormatter(config.report().asciiOnly()).format(outcome.report))
 
             val failure = outcome.failure ?: return 0
+            // Счётчик обработанных — часть условия, а не перестраховка: маркер обещает только
+            // то, что бросили на предусловии, а вызвать такое можно и после работы. Тогда
+            // состояние уже частичное, и код 2 («ничего не сделано») был бы враньём.
+            if (failure is MigrationPrecondition && outcome.report.processed == 0L) {
+                log.error("Migration ${migration.name} REJECTED before start", failure)
+                return 2
+            }
             if (isInterruption(failure)) {
                 // Прерванный одноразовый процесс не завершился успешно: часть работы не сделана.
                 Thread.currentThread().interrupt()

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.MigrationScope
+import io.github.dsudomoin.migration.internal.MigrationRun
 import java.nio.charset.Charset
 import kotlin.reflect.KClass
 import kotlin.reflect.KParameter
@@ -27,6 +28,18 @@ import kotlin.reflect.full.primaryConstructor
  * Отсутствие колонки под обязательное поле проверяется один раз, до первой записи, и валит
  * прогон списком всех недостающих сразу — чинить файл по одной колонке за прогон незачем.
  *
+ * **Файл проверяется целиком до старта.** Прежде чем отдать первый объект, весь файл
+ * разбирается вхолостую, и если хоть одна строка не собирается — прогон падает
+ * [CsvValidationException] со списком всех таких строк, не тронув целевую систему. Цена —
+ * второе чтение файла; выключается через [streaming]. Проверка пропускается сама, когда
+ * [onRowError] и так разрешает битые строки: искать в файле то, что заведомо простят, незачем.
+ *
+ * Дважды разбирается только сам файл — прикладной код не вызывается ни разу: в отличие от
+ * [readCsv] с лямбдой, здесь весь путь «строка → объект» принадлежит библиотеке и заведомо
+ * не имеет побочных эффектов. Поэтому предпроверки у [readCsv] нет и быть не может.
+ *
+ * @param streaming не проверять файл заранее, а падать по ходу — для файлов, второе чтение
+ *                  которых слишком дорого.
  * @see readCsv параметры [path], [classpath], [delimiter], [quote], [charset] и [onRowError]
  *              означают то же самое.
  */
@@ -37,14 +50,33 @@ inline fun <reified T : Any> MigrationScope.readCsvAs(
     quote: Char = '"',
     charset: Charset = Charsets.UTF_8,
     onRowError: ItemError<CsvRow> = ItemError.Fail,
+    streaming: Boolean = false,
+): Sequence<T> = readCsvAs(T::class, path, classpath, delimiter, quote, charset, onRowError, streaming)
+
+/**
+ * [readCsvAs] с типом, переданным значением, — для случаев, когда DTO выбирается в рантайме.
+ * Обычный код зовёт `readCsvAs<Customer>(path)`.
+ */
+fun <T : Any> MigrationScope.readCsvAs(
+    type: KClass<T>,
+    path: String,
+    classpath: Boolean = false,
+    delimiter: Char = ',',
+    quote: Char = '"',
+    charset: Charset = Charsets.UTF_8,
+    onRowError: ItemError<CsvRow> = ItemError.Fail,
+    streaming: Boolean = false,
 ): Sequence<T> {
-    val binder = csvBinder(T::class)
+    val run = this as MigrationRun
+    if (!streaming && onRowError !is ItemError.Skip) {
+        val probe = CsvBinder(type)
+        validateCsv(path, { openCsvStream(run, path, classpath) }, delimiter, quote, charset, onRowError) {
+            probe.bind(it)
+        }
+    }
+    val binder = CsvBinder(type)
     return readCsv(path, classpath, delimiter, quote, charset, onRowError) { binder.bind(it) }
 }
-
-/** Точка входа для инлайна [readCsvAs]; прикладной код зовёт `readCsvAs<T>(...)`. */
-@PublishedApi
-internal fun <T : Any> csvBinder(type: KClass<T>): CsvBinder<T> = CsvBinder(type)
 
 /**
  * Сборка DTO из [CsvRow]: сначала своя проверка обязательных полей, потом Jackson.
@@ -56,7 +88,6 @@ internal fun <T : Any> csvBinder(type: KClass<T>): CsvBinder<T> = CsvBinder(type
  * Не thread-safe и не должен быть: последовательность читается тем же потоком, который крутит
  * цикл `each`, — воркеры получают уже собранные объекты.
  */
-@PublishedApi
 internal class CsvBinder<T : Any>(private val type: KClass<T>) {
 
     private class Field(
@@ -89,7 +120,7 @@ internal class CsvBinder<T : Any>(private val type: KClass<T>) {
                 f.optional -> Unit
                 f.nullable -> values[f.name] = null
                 f.textual -> values[f.name] = raw
-                else -> throw IllegalArgumentException(
+                else -> throw CsvCellException(
                     "строка ${row.lineNumber}: колонка '${row.columnName(f.name) ?: f.name}' пуста, " +
                         "а поле '${f.name}' типа ${f.typeName} обязательно — заполните ячейку, " +
                         "сделайте поле nullable или задайте значение по умолчанию",
@@ -133,3 +164,11 @@ internal class CsvBinder<T : Any>(private val type: KClass<T>) {
         }
     }
 }
+
+/**
+ * Ошибка одной ячейки, чей текст уже называет номер строки.
+ *
+ * Отдельный тип, чтобы предпроверка не приписала номер второй раз: сообщения от Jackson
+ * его не содержат и нумеруются ею, а эти — содержат.
+ */
+internal class CsvCellException(message: String) : IllegalArgumentException(message)

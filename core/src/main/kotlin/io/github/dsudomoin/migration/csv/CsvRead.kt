@@ -42,7 +42,7 @@ fun <T> MigrationScope.readCsv(
     }
 }
 
-private fun openCsvStream(run: MigrationRun, path: String, classpath: Boolean): InputStream =
+internal fun openCsvStream(run: MigrationRun, path: String, classpath: Boolean): InputStream =
     if (classpath) {
         // contextClassLoader может быть null (system threads, кастомные пулы) — fallback на
         // загрузчик нашего класса, он есть всегда.
@@ -108,7 +108,7 @@ private fun <T> csvSequence(
 // строки как «лишнюю» (Too many entries: expected at most 0) — а колонок мы заранее и не знаем.
 private val CSV_MAPPER = CsvMapper().apply { enable(CsvParser.Feature.WRAP_AS_ARRAY) }
 
-private fun rowReader(delimiter: Char, quote: Char) =
+internal fun rowReader(delimiter: Char, quote: Char) =
     CSV_MAPPER.readerFor(Array<String>::class.java).with(
         CsvSchema.emptySchema()
             .withColumnSeparator(delimiter)
@@ -117,7 +117,7 @@ private fun rowReader(delimiter: Char, quote: Char) =
 
 // Хвостовая пустая строка — норма для выгрузок; считать её битой записью значило бы
 // сыпать в errors.csv на ровном месте.
-private fun isBlankRow(cells: Array<String>): Boolean =
+internal fun isBlankRow(cells: Array<String>): Boolean =
     cells.isEmpty() || (cells.size == 1 && cells[0].isBlank())
 
 private fun handleRowError(

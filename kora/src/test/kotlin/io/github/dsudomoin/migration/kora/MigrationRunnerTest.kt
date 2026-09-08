@@ -2,6 +2,7 @@ package io.github.dsudomoin.migration.kora
 
 import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.Migration
+import io.github.dsudomoin.migration.MigrationPrecondition
 import io.github.dsudomoin.migration.MigrationScope
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
@@ -33,6 +34,21 @@ class MigrationRunnerTest {
             }
         }
     }
+
+    private class RejectedInput : Migration("REJECT-001") {
+        override fun MigrationScope.run() {
+            throw InputRejected("файл выгрузки не той формы")
+        }
+    }
+
+    private class RejectedAfterWork : Migration("LATE-REJECT-001") {
+        override fun MigrationScope.run() {
+            each(listOf(1, 2, 3)) { }
+            throw InputRejected("поздно спохватились")
+        }
+    }
+
+    private class InputRejected(message: String) : RuntimeException(message), MigrationPrecondition
 
     private fun config(run: String?) = MigrationConfigValues(
         run = run,
@@ -68,6 +84,16 @@ class MigrationRunnerTest {
     @Test
     fun `превышенный порог ошибок даёт 1`() {
         assertThat(runWith("THRESHOLD-001", listOf(OverThreshold()))).containsExactly(1)
+    }
+
+    @Test
+    fun `отказ на предусловии до первого элемента даёт 2`() {
+        assertThat(runWith("REJECT-001", listOf(RejectedInput()))).containsExactly(2)
+    }
+
+    @Test
+    fun `предусловие после обработанных элементов даёт 1 — состояние уже частичное`() {
+        assertThat(runWith("LATE-REJECT-001", listOf(RejectedAfterWork()))).containsExactly(1)
     }
 
     @Test
