@@ -6,7 +6,7 @@ import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.Progress
 import io.github.dsudomoin.migration.csv.CsvRow
 import io.github.dsudomoin.migration.csv.csv
-import io.github.dsudomoin.migration.csv.readCsv
+import io.github.dsudomoin.migration.csv.readCsvAs
 import io.github.dsudomoin.migration.error.includeItem
 import ru.tinkoff.kora.common.Component
 
@@ -18,7 +18,8 @@ data class Customer(val id: Long, val email: String, val spend: Long)
  * репозиторий, рядом кладём CSV с тем, что получилось.
  *
  * Показывает четыре вещи, ради которых библиотека и существует:
- * - `readCsv(onRowError = ItemError.Skip)` — битая строка не валит прогон, а уезжает в `errors.csv`;
+ * - `readCsvAs<Customer>(onRowError = ItemError.Skip)` — строка сама складывается в DTO, а битая
+ *   не валит прогон, а уезжает в `errors.csv`;
  * - `each(parallel = 4)` — реальные четыре воркера, счётчики и прогресс без ручного кода;
  * - `if (!dryRun)` — единственный способ не тронуть целевую систему на репетиции;
  * - `csv(...)` — выходной файл, который движок закроет сам.
@@ -38,13 +39,7 @@ class BackfillCustomerTier(
         val out = csv("customer-tier.csv", "id", "spend", "tier")
 
         each(
-            readCsv("customers.csv", classpath = true, onRowError = ItemError.Skip) { row ->
-                Customer(
-                    id = row["id"].toLong(),
-                    email = row["email"],
-                    spend = row["spend"].toLong(),
-                )
-            },
+            readCsvAs<Customer>("customers.csv", classpath = true, onRowError = ItemError.Skip),
             parallel = 4,
             onItemError = ItemError.Skip,
             progress = Progress.Every(5),

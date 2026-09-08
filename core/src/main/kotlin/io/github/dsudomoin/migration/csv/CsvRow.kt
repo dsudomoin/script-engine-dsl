@@ -40,6 +40,9 @@ class CsvRow internal constructor(
         return values.getOrElse(idx) { "" }
     }
 
+    /** Как колонка названа в самом файле — чтобы в тексте ошибки указать на неё, а не на поле DTO. */
+    internal fun columnName(column: String): String? = header.indexOf(column)?.let { header.names[it] }
+
     /** Строка всех значений с номером строки — то, что увидит человек в `errors.csv`. */
     override fun toString(): String =
         header.names.indices.joinToString(", ", prefix = "line $lineNumber: ") { i ->
