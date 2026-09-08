@@ -3,6 +3,7 @@ package io.github.dsudomoin.migration.csv
 import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.internal.MigrationRun
 import java.io.BufferedWriter
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
@@ -48,6 +49,7 @@ interface CsvOutput : AutoCloseable {
 private class CsvOutputImpl(
     private val path: Path,
     private val writer: BufferedWriter,
+    private val delimiter: Char,
 ) : CsvOutput {
     private val lock = Any()
 
@@ -57,7 +59,7 @@ private class CsvOutputImpl(
     override fun row(vararg cells: Any?) {
         synchronized(lock) {
             if (closed) throw IllegalStateException("CsvOutput is closed: $path")
-            writer.write(cells.joinToString(",") { csvEscape(it?.toString() ?: "") })
+            writer.write(cells.joinToString(delimiter.toString()) { csvEscape(it?.toString() ?: "", delimiter) })
             writer.newLine()
             // NO flush per row — flush в close()/flush().
         }
@@ -87,14 +89,24 @@ private class CsvOutputImpl(
  * Заголовки квотируются по RFC 4180 — имя колонки вроде `"Order ID, total"` иначе
  * превратилось бы в две колонки вместо одной.
  */
-internal fun openCsvFile(path: Path, headers: List<String>): CsvOutput {
+internal fun openCsvFile(
+    path: Path,
+    headers: List<String>,
+    delimiter: Char = ',',
+    charset: Charset = Charsets.UTF_8,
+    bom: Boolean = false,
+): CsvOutput {
     Files.createDirectories(path.parent ?: Path.of("."))
-    val w = Files.newBufferedWriter(path, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
-    w.write(headers.joinToString(",") { csvEscape(it) })
+    val w = Files.newBufferedWriter(path, charset, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+    if (bom) w.write(BOM)
+    w.write(headers.joinToString(delimiter.toString()) { csvEscape(it, delimiter) })
     w.newLine()
     w.flush()
-    return CsvOutputImpl(path, w)
+    return CsvOutputImpl(path, w, delimiter)
 }
+
+/** U+FEFF: в UTF-8 кодируется теми самыми `EF BB BF`, по которым Excel узнаёт кодировку. */
+private const val BOM = "\uFEFF"
 
 /**
  * Имена, которые движок открывает в `outputFolder` сам.
@@ -109,13 +121,30 @@ private val RESERVED_ARTIFACTS = setOf("errors.csv", "errors.log", "migration.lo
  * CSV-выход прогона: отчёты, экспорты, диагностика. Файл открывается в `outputFolder`
  * один раз на имя и закрывается движком в конце прогона.
  *
- * Повторный вызов с тем же [filename] возвращает тот же handle — см. [MigrationRun.csvOutput].
+ * Повторный вызов с тем же [filename] возвращает тот же handle — см. [MigrationRun.csvOutput];
+ * формат при этом задаётся первым вызовом, последующие его не меняют.
  *
  * Под dry-run файл всё равно пишется: выход — диагностический артефакт, а не изменение
  * целевой системы.
+ *
+ * @param delimiter разделитель колонок. `;` — если файл поедет в Excel в русской локали.
+ * @param charset кодировка файла.
+ * @param bom писать ли BOM. Excel без него читает UTF-8 как ANSI и показывает кириллицу
+ *            кракозябрами; для программного потребителя BOM, наоборот, лишний.
  */
-fun MigrationScope.csv(filename: String, vararg headers: String): CsvOutput {
+fun MigrationScope.csv(
+    filename: String,
+    vararg headers: String,
+    delimiter: Char = ',',
+    charset: Charset = Charsets.UTF_8,
+    bom: Boolean = false,
+): CsvOutput {
     val run = this as MigrationRun
+    // Без проверки BOM уехал бы в файл заменяющим символом (в windows-1251 это '?') и сломал
+    // бы имя первой колонки — ровно ту беду, от которой он и должен спасать.
+    require(!bom || charset.newEncoder().canEncode(BOM)) {
+        "csv '$filename': кодировка ${charset.name()} не умеет BOM — уберите bom = true"
+    }
     val normalized = try {
         Path.of(filename).normalize()
     } catch (e: InvalidPathException) {
@@ -128,6 +157,6 @@ fun MigrationScope.csv(filename: String, vararg headers: String): CsvOutput {
         "csv '$filename' uses a reserved engine artifact name: $RESERVED_ARTIFACTS"
     }
     return run.csvOutput(normalized.toString()) {
-        openCsvFile(outputFolder.resolve(normalized), headers.toList())
+        openCsvFile(outputFolder.resolve(normalized), headers.toList(), delimiter, charset, bom)
     }
 }

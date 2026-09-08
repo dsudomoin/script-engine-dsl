@@ -7,6 +7,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -39,6 +40,87 @@ class CsvWriteTest {
 
         assertThat(Files.readAllLines(tmp.resolve("out.csv")))
             .containsExactly("id,status", "1,ok", "2,ok")
+    }
+
+    @Test
+    fun `разделитель применяется и к заголовку, и к строкам`() {
+        runWriting {
+            csv("out.csv", "id", "status", delimiter = ';').also { it.row(1, "ok") }
+        }
+
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"))).containsExactly("id;status", "1;ok")
+    }
+
+    @Test
+    fun `квотирование идёт по своему разделителю, а не по запятой`() {
+        runWriting {
+            csv("out.csv", "id", "name", delimiter = ';').also {
+                it.row(1, "Иванов; ООО")
+                it.row(2, "Петров, ИП")
+            }
+        }
+
+        // Точка с запятой рвёт строку и потому квотируется; запятая при этом разделителем
+        // не является и остаётся обычным символом — иначе файл распухал бы кавычками впустую.
+        assertThat(Files.readAllLines(tmp.resolve("out.csv")))
+            .containsExactly("id;name", """1;"Иванов; ООО"""", "2;Петров, ИП")
+    }
+
+    @Test
+    fun `BOM пишется по запросу — Excel открывает кириллицу без бубна`() {
+        runWriting {
+            csv("out.csv", "имя", bom = true).also { it.row("Иван") }
+        }
+
+        val bytes = Files.readAllBytes(tmp.resolve("out.csv"))
+        assertThat(bytes.take(3)).containsExactly(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte())
+    }
+
+    @Test
+    fun `charset применяется к содержимому`() {
+        val cp1251 = Charset.forName("windows-1251")
+        runWriting {
+            csv("out.csv", "имя", charset = cp1251).also { it.row("Иван") }
+        }
+
+        assertThat(Files.readAllLines(tmp.resolve("out.csv"), cp1251)).containsExactly("имя", "Иван")
+    }
+
+    @Test
+    fun `BOM в кодировке, которая его не умеет, отвергается до записи`() {
+        val migration = object : Migration("CSV-BOM-BAD") {
+            override fun MigrationScope.run() {
+                csv("out.csv", "имя", charset = Charset.forName("windows-1251"), bom = true)
+            }
+        }
+
+        val outcome = MigrationTest.run(migration, outputFolder = tmp)
+
+        // Иначе BOM молча уехал бы в файл вопросительным знаком и сломал первую колонку.
+        assertThat(outcome.failure).isInstanceOf(IllegalArgumentException::class.java)
+        assertThat(outcome.failure).hasMessageContaining("windows-1251")
+        assertThat(Files.exists(tmp.resolve("out.csv"))).isFalse()
+    }
+
+    @Test
+    fun `выход в чужом формате читается обратно своим же readCsv`() {
+        val cp1251 = Charset.forName("windows-1251")
+        runWriting {
+            csv("out.csv", "id", "name", delimiter = ';', charset = cp1251).also {
+                it.row(1, "Иванов; ООО")
+                it.row(2, "Пётр")
+            }
+        }
+
+        val seen = mutableListOf<String>()
+        val reader = object : Migration("CSV-ROUNDTRIP") {
+            override fun MigrationScope.run() {
+                readCsv(tmp.resolve("out.csv").toString(), delimiter = ';', charset = cp1251) { it["name"] }
+                    .forEach { seen += it }
+            }
+        }
+        assertThat(MigrationTest.run(reader, outputFolder = tmp.resolve("rt")).failure).isNull()
+        assertThat(seen).containsExactly("Иванов; ООО", "Пётр")
     }
 
     @Test
