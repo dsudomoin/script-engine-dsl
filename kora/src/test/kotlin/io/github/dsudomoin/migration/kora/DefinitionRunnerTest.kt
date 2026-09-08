@@ -47,7 +47,7 @@ class DefinitionRunnerTest {
         onReport: (MigrationReport) -> Unit = {},
     ): Pair<MigrationRunner, MutableList<Int>> {
         val codes = mutableListOf<Int>()
-        val runner = MigrationRunner(config, definitions.toList(), null, onReport) { codes += it }
+        val runner = MigrationRunner(config, definitions.toList(), onReport) { codes += it }
         return runner to codes
     }
 

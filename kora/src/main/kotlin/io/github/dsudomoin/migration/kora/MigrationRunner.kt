@@ -20,7 +20,6 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.*
-import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -37,8 +36,8 @@ import kotlin.system.exitProcess
  * 2. Проверка уникальности имён [Migration]'ов в графе → exit 2 при дубликате.
  * 3. Lookup миграции по имени → exit 2 при отсутствии.
  * 4. Создание `outputFolder`, attach logback `FileAppender` к root-логгеру.
- * 5. Создание [io.github.dsudomoin.migration.error.CsvFileErrorReporter], [io.github.dsudomoin.migration.report.ReportBuilder],
- *    `Executor` (из `@Tag(MigrationExecutor)` или дефолт-FixedThreadPool).
+ * 5. Создание [io.github.dsudomoin.migration.error.CsvFileErrorReporter], [io.github.dsudomoin.migration.report.ReportBuilder]
+ *    и cached-пула потоков.
  * 6. Исполнение плана интерпретатором в try/catch (политика по [MigrationPlan.onUnhandled]).
  * 7. В `finally`: `ctx.closeRegistered()` (все user-registered ресурсы), потом reporter.close().
  * 8. Печать отчёта в лог, exit с кодом 0 / 1 / 2.
@@ -52,7 +51,6 @@ import kotlin.system.exitProcess
  * - `2` — misconfiguration: unknown name, duplicate name, битый `outputFolder`, ошибка построения
  *   плана, расхождение [MigrationDefinition.name] и имени плана.
  *
- * @param customExecutor если не `null`, используется вместо дефолт-FixedThreadPool.
  * @param onReport инжекция для тестов: готовый отчёт до того, как он уйдёт в лог.
  * @param exit инжекция для тестов — по умолчанию `System.exit`. Стоит последним намеренно:
  *             trailing-лямбда на месте вызова обязана означать именно завершение процесса.
@@ -60,7 +58,6 @@ import kotlin.system.exitProcess
 class MigrationRunner(
     private val config: MigrationConfig,
     private val definitions: List<MigrationDefinition>,
-    private val customExecutor: Executor?,
     private val onReport: (MigrationReport) -> Unit = {},
     private val exit: (Int) -> Unit = { exitProcess(it) },
 ) : Lifecycle {
@@ -154,7 +151,7 @@ class MigrationRunner(
             // свой семафор, и пул обязан уметь выдать N потоков — иначе `parallel` был бы
             // декорацией. Потоки daemon и переиспользуются, простаивающие отмирают сами.
             val threadNo = AtomicInteger()
-            val executor = customExecutor ?: Executors.newCachedThreadPool { r ->
+            val executor = Executors.newCachedThreadPool { r ->
                 Thread(r, "migration-${plan.name}-${threadNo.incrementAndGet()}").apply { isDaemon = true }
             }
             val ctx = RunContext.internalCreate(
@@ -168,12 +165,9 @@ class MigrationRunner(
                 errorThreshold = config.defaults().errorThreshold(),
                 defaultParallel = config.defaults().parallel(),
             )
-            // Дефолтный пул owned runner'ом — регистрируем shutdown как AutoCloseable, чтобы
-            // ctx.closeRegistered() (в finally ниже) его остановил. Custom executor лежит на
-            // ответственности пользователя — не трогаем.
-            if (customExecutor == null && executor is ExecutorService) {
-                ctx.register(AutoCloseable { shutdownPool(executor, report) })
-            }
+            // Пул owned runner'ом — регистрируем shutdown как AutoCloseable, чтобы
+            // ctx.closeRegistered() (в finally ниже) его остановил.
+            ctx.register(AutoCloseable { shutdownPool(executor, report) })
 
             var code = try {
                 runMigration(plan, ctx)
