@@ -62,7 +62,7 @@ class CountersIdentityTest {
         val migration = object : Migration("SOURCE-SKIP") {
             override fun MigrationScope.run() {
                 val rows = readCsv(file.toString(), onRowError = ItemError.Skip) {
-                    it.getValue("spend").toLong()
+                    it["spend"].toLong()
                 }
                 each(rows) { }
             }

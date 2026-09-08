@@ -4,6 +4,7 @@ import io.github.dsudomoin.migration.ItemError
 import io.github.dsudomoin.migration.Migration
 import io.github.dsudomoin.migration.MigrationScope
 import io.github.dsudomoin.migration.Progress
+import io.github.dsudomoin.migration.csv.CsvRow
 import io.github.dsudomoin.migration.csv.csv
 import io.github.dsudomoin.migration.csv.readCsv
 import io.github.dsudomoin.migration.error.includeItem
@@ -32,16 +33,16 @@ class BackfillCustomerTier(
         // регистрации, потому что до обработчика строка может сломаться ещё на разборе —
         // тогда аудит получает сырую строку CSV, а не Customer.
         errors.includeItem<Customer> { "id=${it.id}" }
-        errors.includeItem<Map<String, String>> { "id=${it["id"]}" }
+        errors.includeItem<CsvRow> { "id=${it["id"]}" }
 
         val out = csv("customer-tier.csv", "id", "spend", "tier")
 
         each(
             readCsv("customers.csv", classpath = true, onRowError = ItemError.Skip) { row ->
                 Customer(
-                    id = row.getValue("id").toLong(),
-                    email = row.getValue("email"),
-                    spend = row.getValue("spend").toLong(),
+                    id = row["id"].toLong(),
+                    email = row["email"],
+                    spend = row["spend"].toLong(),
                 )
             },
             parallel = 4,

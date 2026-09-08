@@ -82,7 +82,7 @@ class CsvOnScopeTest {
         val migration = object : Migration("CSV-005") {
             override fun MigrationScope.run() {
                 val rows = readCsv("input/contracts.csv", classpath = true) { row ->
-                    row.getValue("contract") to row.getValue("value").toInt()
+                    row["contract"] to row["value"].toInt()
                 }
                 each(rows) { seen += it }
             }
@@ -103,7 +103,7 @@ class CsvOnScopeTest {
         val migration = object : Migration("CSV-006") {
             override fun MigrationScope.run() {
                 val rows = readCsv(file.toString(), onRowError = ItemError.Skip) { row ->
-                    row.getValue("value").toInt()
+                    row["value"].toInt()
                 }
                 each(rows) { seen += it }
             }

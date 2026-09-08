@@ -31,12 +31,12 @@ class CsvReadRowErrorTest {
 
     private fun readInto(
         sink: MutableList<Long>,
-        onRowError: ItemError<Map<String, String>>,
+        onRowError: ItemError<CsvRow>,
         file: Path = input,
     ): Pair<MigrationReport, Throwable?> {
         val migration = object : Migration("CSV-ROWS") {
             override fun MigrationScope.run() {
-                readCsv(file.toString(), onRowError = onRowError) { it.getValue("spend").toLong() }
+                readCsv(file.toString(), onRowError = onRowError) { it["spend"].toLong() }
                     .forEach { sink += it }
             }
         }
@@ -90,7 +90,7 @@ class CsvReadRowErrorTest {
             override fun MigrationScope.run() {
                 // take(1) бросает корутину генератора на полпути: use-блок внутри неё не
                 // доигрывает, и без регистрации в реестре поток остался бы открытым до конца процесса.
-                first += readCsv(input.toString()) { it.getValue("id") }.take(1).toList()
+                first += readCsv(input.toString()) { it["id"] }.take(1).toList()
             }
         }
 
